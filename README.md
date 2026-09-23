@@ -29,25 +29,27 @@ cargo install --path .
 ## You don't have to know the directive names
 
 The host editor is a list of rows. Move with `↑`/`↓`, press `enter` to change
-whatever you are on, `space` to flip a yes/no, `d` to remove it, `a` to add a
-port forward from anywhere, `ctrl-s` to save. Every row explains itself in a line of prose at the bottom of the form.
+whatever you are on, `space` to switch a forward on or off or flip a yes/no,
+`d` to remove a row, `a` to add a port forward from anywhere, and `esc` when
+you're done. There is no save step: every change is written as you make it.
+Every row explains itself in a line of prose at the bottom of the screen.
 
 ```
-╭ Edit host ───────────────────────────────────────────╮
-│ ▸ Host              nas                              │
+╭ Edit nas ────────────────────────────────────────────╮
+│ ▸ Host          nas                                  │
 │                                                      │
-│   Connection                                         │
-│   HostName          10.0.0.4                         │
-│   User              st                               │
-│   Port              —                                │
-│   IdentityFile      —                                │
+│ Connection                                           │
+│   HostName      10.0.0.4                             │
+│   User          st                                   │
+│   Port          —                                    │
+│   IdentityFile  —                                    │
 │                                                      │
-│   Port forwards                                      │
-│   local   8081 → 127.0.0.1:8081                      │
-│   local   32400 → 127.0.0.1:32400                    │
+│ Port forwards                                        │
+│   ● local  8081 → 127.0.0.1:8081                     │
+│   ○ local  32400 → 127.0.0.1:32400  off              │
 │   + add a port forward                               │
 │                                                      │
-│   Options                                            │
+│ Options                                              │
 │   ServerAliveInterval  60                            │
 │   + add an option                                    │
 ╰──────────────────────────────────────────────────────╯
@@ -59,6 +61,12 @@ port forward from anywhere, `ctrl-s` to save. Every row explains itself in a lin
 you type, names the fields after what they do ("Listen on this machine",
 "Reaching, from the server") and refuses to save a half-finished tunnel.
 
+`space` on a forward **switches it off** without losing it: the line is
+written commented out, `# LocalForward 8081 127.0.0.1:8081`, and `space`
+again switches it back on. Forwards you've commented out by hand are picked
+up the same way. Comments that merely mention a forward ("# LocalForward for
+the database") are left alone — only a line that is a valid forward counts.
+
 **Every other option** comes from a searchable catalogue of all 99 documented
 `ssh_config` keywords. You can search by name, by description, or by what you
 are actually trying to do — "socks", "bastion", "keepalive", "idle", "multiplex",
@@ -66,6 +74,13 @@ are actually trying to do — "socks", "bastion", "keepalive", "idle", "multiple
 its type: a value list for yes/no and enum options (so you never have to
 remember whether it's `ask` or `confirm`), a text box for the rest, with the
 documented default shown next to it.
+
+Values are checked before they are written, using the same rules as ssh's own
+parser — a port must be 1–65535, a time looks like `30`, `5m` or `1h30m`, a
+choice must be one of its values. That matters because ssh refuses to run at
+all, for every host, when the config has a value it can't parse. A rejected
+value stays in its box with an explanation, so it can be fixed rather than
+retyped.
 
 The catalogue is generated from OpenSSH's own sources — the keyword list,
 value types and allowed values come from its parser (`readconf.c`), the
@@ -93,8 +108,20 @@ python3 tools/gen_schema.py     # regenerates src/schema.rs
 | `q` | quit |
 
 In the editor: `↑`/`↓` move, `enter` edits the row or opens its dialog, `a`
-adds a port forward, `space` flips a yes/no, `d` removes the row, `ctrl-s`
-saves, `esc` cancels or closes a dialog.
+adds a port forward, `space` switches a forward on/off or flips a yes/no, `d`
+removes the row (asks first), `esc` closes a dialog or leaves the editor.
+
+The footer always shows the keys that do something right now.
+
+## Small terminals
+
+The layout follows the window. From 72 columns the host list and details sit
+side by side; narrower, the details move under the list; when the window is
+short as well, the list is shown alone. Dialogs float in the middle while
+there's room around them and take the whole window when there isn't. Text
+that doesn't fit is cut short with `…` rather than wrapped out of line, and
+the key hints drop the least important ones first — the way out (`esc`, `?`)
+always stays. Below 36×10 it says how much room it needs.
 
 ## How it treats your file
 
@@ -110,12 +137,23 @@ already in. Directive names are normalised to their canonical spelling
 (`port` becomes `Port`). Nothing is dropped: options the editor doesn't model —
 unix-socket forwards, say — stay editable as raw text.
 
-Saving happens immediately on add, edit, duplicate and delete. Every write:
+Every change is saved the moment it's made. Every write:
 
-- copies the previous file to `~/.ssh/config.bak` first,
+- checks the file hasn't been changed by another program since sshconfig read
+  it — if it has, it asks whether to overwrite it or reload theirs, rather than
+  silently clobbering an edit you made in your editor,
 - writes to a temp file in the same directory and renames it into place, so an
   interrupted write can't leave you with half a config,
 - creates the file `0600`.
+
+The first write of a session copies the file to `~/.ssh/config.bak`. Later
+writes leave the backup alone, so it always holds the file as it was before
+you started — with every change saving straight away, that's the useful undo.
+
+Anything that throws something away asks first: deleting a host, removing a
+row, overwriting another program's change, and reloading or quitting while a
+change couldn't be saved. Status messages clear themselves after a couple of
+seconds (errors stay up a little longer).
 
 Entries whose alias contains a wildcard (`Host *`) and `Match` blocks are shown
 but can't be connected to. `Match` blocks are shown read-only — their semantics

@@ -744,7 +744,7 @@ pub static KEYWORDS: &[Keyword] = &[
     },
     Keyword {
         name: "RekeyLimit",
-        kind: Kind::Time,
+        kind: Kind::Text,
         values: &[],
         desc: "Specifies the maximum amount of data that may be transmitted or received before the session key is renegotiated,…",
         aliases: "",

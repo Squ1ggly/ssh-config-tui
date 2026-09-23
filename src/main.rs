@@ -7,16 +7,21 @@ mod forward;
 mod schema;
 mod textinput;
 mod ui;
+mod validate;
 
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 
 use app::App;
 use config::SshConfig;
+
+/// How long to wait for a key when nothing is scheduled.
+const IDLE_WAKE: Duration = Duration::from_secs(60);
 
 const USAGE: &str = "\
 sshconfig — a terminal UI for ~/.ssh/config
@@ -77,9 +82,17 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        if let Event::Key(key) = event::read()? {
+        // Sleep until a key arrives or the status message is due to vanish,
+        // whichever comes first. Resizes also wake us, and simply redraw.
+        let timeout = app.status_deadline().map_or(IDLE_WAKE, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+        {
             app.on_key(key);
         }
+        app.expire_status(Instant::now());
 
         if let Some(host) = app.connect_to.take() {
             // Hand the terminal back to ssh, then take it again afterwards.

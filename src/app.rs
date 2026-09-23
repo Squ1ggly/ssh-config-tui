@@ -1,17 +1,28 @@
 //! Application state and key handling. Rendering lives in `ui`.
+//!
+//! Every change is written the moment it's made. Anything that throws data
+//! away — deleting a host, removing a row, overwriting someone else's edit,
+//! dropping changes that couldn't be saved — goes through a confirm dialog.
+
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::config::{Block, BlockKind, SshConfig};
-use crate::editor::Editor;
+use crate::config::{Block, BlockKind, SaveError, SshConfig, display_path};
+use crate::editor::{Editor, EditorEvent};
+
+/// How long a message stays in the status bar.
+pub const INFO_TTL: Duration = Duration::from_secs(2);
+/// Errors stay a little longer: they usually need reading.
+pub const ERROR_TTL: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     List,
     Search,
     Edit,
-    ConfirmDelete,
+    Confirm,
     Help,
 }
 
@@ -21,13 +32,58 @@ pub enum StatusKind {
     Error,
 }
 
+pub struct Status {
+    pub text: String,
+    pub kind: StatusKind,
+    pub shown_at: Instant,
+}
+
+impl Status {
+    fn expires_at(&self) -> Instant {
+        self.shown_at
+            + match self.kind {
+                StatusKind::Info => INFO_TTL,
+                StatusKind::Error => ERROR_TTL,
+            }
+    }
+}
+
+/// Something that waits on a confirm dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    DeleteHost(usize),
+    /// Write our version over a file another program changed.
+    Overwrite,
+    /// Take the other program's version, dropping our unsaved change.
+    ReloadTheirs,
+    /// Reload, dropping changes that couldn't be saved.
+    Reload,
+    /// Quit, dropping changes that couldn't be saved.
+    Quit,
+}
+
+pub struct Confirm {
+    pub title: &'static str,
+    pub message: String,
+    /// Key, label and what it does. Any other key cancels.
+    pub choices: Vec<(char, &'static str, Action)>,
+    /// Shown when the dialog is dismissed without choosing.
+    pub cancel_note: Option<&'static str>,
+    /// The mode to go back to afterwards.
+    back_to: Mode,
+}
+
 pub struct App {
     pub config: SshConfig,
     pub mode: Mode,
     pub filter: String,
     pub list_state: ListState,
     pub editor: Option<Editor>,
-    pub status: Option<(String, StatusKind)>,
+    pub status: Option<Status>,
+    pub confirm: Option<Confirm>,
+    /// In-memory changes that aren't on disk because a save failed or was
+    /// declined. Reloading or quitting would lose them, so both ask first.
+    pub unsaved: bool,
     pub should_quit: bool,
     /// Set when the user asks to connect; `main` drains this, drops out of the
     /// alternate screen and runs ssh.
@@ -43,6 +99,8 @@ impl App {
             list_state: ListState::default(),
             editor: None,
             status: None,
+            confirm: None,
+            unsaved: false,
             should_quit: false,
             connect_to: None,
         };
@@ -90,11 +148,34 @@ impl App {
     }
 
     fn info(&mut self, msg: impl Into<String>) {
-        self.status = Some((msg.into(), StatusKind::Info));
+        self.set_status(msg.into(), StatusKind::Info);
     }
 
     fn error(&mut self, msg: impl Into<String>) {
-        self.status = Some((msg.into(), StatusKind::Error));
+        self.set_status(msg.into(), StatusKind::Error);
+    }
+
+    fn set_status(&mut self, text: String, kind: StatusKind) {
+        self.status = Some(Status {
+            text,
+            kind,
+            shown_at: Instant::now(),
+        });
+    }
+
+    /// When the current message should disappear, so the event loop knows how
+    /// long it can sleep.
+    pub fn status_deadline(&self) -> Option<Instant> {
+        self.status.as_ref().map(Status::expires_at)
+    }
+
+    /// Clears the message once its time is up. Returns whether it did.
+    pub fn expire_status(&mut self, now: Instant) -> bool {
+        if self.status.as_ref().is_some_and(|s| now >= s.expires_at()) {
+            self.status = None;
+            return true;
+        }
+        false
     }
 
     fn clamp_selection(&mut self) {
@@ -117,21 +198,62 @@ impl App {
         self.list_state.select(Some(next));
     }
 
-    fn save(&mut self) {
-        match self.config.save() {
+    /// Opens a confirm dialog over whatever is on screen.
+    fn ask(
+        &mut self,
+        title: &'static str,
+        message: String,
+        choices: Vec<(char, &'static str, Action)>,
+        cancel_note: Option<&'static str>,
+    ) {
+        let back_to = if self.mode == Mode::Confirm {
+            self.confirm.as_ref().map_or(Mode::List, |c| c.back_to)
+        } else {
+            self.mode
+        };
+        self.confirm = Some(Confirm {
+            title,
+            message,
+            choices,
+            cancel_note,
+            back_to,
+        });
+        self.mode = Mode::Confirm;
+    }
+
+    /// Writes the config. Returns whether it reached the disk.
+    fn persist(&mut self, force: bool) -> bool {
+        match self.config.save(force) {
             Ok(()) => {
-                let backup = self.config.backup_path();
-                let name = backup
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                self.info(format!(
-                    "Saved {} (backup: {name})",
-                    self.config.path.display()
-                ));
+                self.unsaved = false;
+                true
             }
-            Err(e) => self.error(format!("Could not save: {e}")),
+            Err(SaveError::Conflict) => {
+                self.unsaved = true;
+                let path = display_path(&self.config.path);
+                self.ask(
+                    " File changed on disk ",
+                    format!(
+                        "{path} was changed by another program since sshconfig read it. \
+                         Saving now would overwrite that change."
+                    ),
+                    vec![
+                        ('o', "overwrite it with my version", Action::Overwrite),
+                        (
+                            'r',
+                            "reload theirs, dropping my change",
+                            Action::ReloadTheirs,
+                        ),
+                    ],
+                    Some("Not saved — your change is only in sshconfig for now"),
+                );
+                false
+            }
+            Err(SaveError::Io(e)) => {
+                self.unsaved = true;
+                self.error(format!("Could not save: {e}"));
+                false
+            }
         }
     }
 
@@ -144,7 +266,7 @@ impl App {
             Mode::List => self.on_key_list(key),
             Mode::Search => self.on_key_search(key),
             Mode::Edit => self.on_key_edit(key),
-            Mode::ConfirmDelete => self.on_key_confirm(key),
+            Mode::Confirm => self.on_key_confirm(key),
             Mode::Help => {
                 self.mode = Mode::List;
             }
@@ -153,11 +275,10 @@ impl App {
 
     fn on_key_list(&mut self, key: KeyEvent) {
         self.status = None;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
-            }
+            KeyCode::Char('q') | KeyCode::Esc => self.quit(),
+            KeyCode::Char('c') if ctrl => self.quit(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('g') | KeyCode::Home => self.list_state.select_first(),
@@ -176,12 +297,8 @@ impl App {
             KeyCode::Char('a') => self.begin_add(),
             KeyCode::Char('e') | KeyCode::Enter => self.begin_edit(),
             KeyCode::Char('y') => self.duplicate(),
-            KeyCode::Char('d') => {
-                if self.selected_block().is_some() {
-                    self.mode = Mode::ConfirmDelete;
-                }
-            }
-            KeyCode::Char('r') => self.reload(),
+            KeyCode::Char('d') => self.ask_delete(),
+            KeyCode::Char('r') => self.ask_reload(),
             KeyCode::Char('l') => self.begin_connect(),
             _ => {}
         }
@@ -213,25 +330,96 @@ impl App {
     }
 
     fn on_key_confirm(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(index) = self.selected_block() {
-                    let label = self.config.blocks[index].label();
-                    self.config.blocks.remove(index);
-                    self.clamp_selection();
-                    self.save();
-                    if !matches!(self.status, Some((_, StatusKind::Error))) {
-                        self.info(format!("Deleted {label}"));
-                    }
+        let Some(confirm) = self.confirm.take() else {
+            self.mode = Mode::List;
+            return;
+        };
+        self.mode = confirm.back_to;
+
+        let chosen = match key.code {
+            KeyCode::Char(c) => confirm
+                .choices
+                .iter()
+                .find(|(k, _, _)| k.eq_ignore_ascii_case(&c))
+                .map(|(_, _, action)| *action),
+            _ => None,
+        };
+        match chosen {
+            Some(action) => self.run(action),
+            None => {
+                if let Some(note) = confirm.cancel_note {
+                    self.info(note);
                 }
-                self.mode = Mode::List;
             }
-            _ => self.mode = Mode::List,
+        }
+    }
+
+    fn run(&mut self, action: Action) {
+        match action {
+            Action::DeleteHost(index) => {
+                let label = self.config.blocks[index].label();
+                self.config.blocks.remove(index);
+                self.clamp_selection();
+                if self.persist(false) {
+                    self.info(format!("Deleted {label}"));
+                }
+            }
+            Action::Overwrite => {
+                if self.persist(true) {
+                    self.info("Saved — the other program's change was overwritten");
+                }
+            }
+            Action::ReloadTheirs | Action::Reload => {
+                // Block indices may mean something else in the reloaded file.
+                self.editor = None;
+                self.mode = Mode::List;
+                self.reload();
+            }
+            Action::Quit => self.should_quit = true,
+        }
+    }
+
+    fn quit(&mut self) {
+        if self.unsaved {
+            self.ask(
+                " Unsaved changes ",
+                "Some changes couldn't be saved. Quitting now will lose them.".into(),
+                vec![('y', "quit anyway", Action::Quit)],
+                None,
+            );
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    fn ask_delete(&mut self) {
+        let Some(index) = self.selected_block() else {
+            return;
+        };
+        let label = self.config.blocks[index].label();
+        self.ask(
+            " Delete host ",
+            format!("Delete {label}? It is removed from the file straight away."),
+            vec![('y', "delete", Action::DeleteHost(index))],
+            None,
+        );
+    }
+
+    fn ask_reload(&mut self) {
+        if self.unsaved {
+            self.ask(
+                " Reload ",
+                "Some changes couldn't be saved. Reloading drops them.".into(),
+                vec![('y', "reload anyway", Action::Reload)],
+                None,
+            );
+        } else {
+            self.reload();
         }
     }
 
     fn begin_add(&mut self) {
-        self.editor = Some(Editor::new(None, &Block::new_host("")));
+        self.editor = Some(Editor::new_host());
         self.mode = Mode::Edit;
     }
 
@@ -260,16 +448,18 @@ impl App {
         if let Some(position) = position {
             self.list_state.select(Some(position));
         }
-        self.save();
-        if !matches!(self.status, Some((_, StatusKind::Error))) {
-            self.info(format!("Duplicated as {alias} — press e to edit"));
+        if self.persist(false) {
+            self.info(format!("Duplicated as {alias}"));
         }
     }
 
     fn reload(&mut self) {
         match SshConfig::load(self.config.path.clone()) {
-            Ok(config) => {
+            Ok(mut config) => {
+                // The backup still holds the file from before this session.
+                config.backed_up = self.config.backed_up;
                 self.config = config;
+                self.unsaved = false;
                 self.clamp_selection();
                 self.info("Reloaded from disk");
             }
@@ -291,29 +481,32 @@ impl App {
             self.mode = Mode::List;
             return;
         };
-        match editor.handle_key(key) {
-            Some(true) => self.commit_editor(),
-            Some(false) => {
+        let event = editor.handle_key(key);
+        let message = editor.error.clone();
+        let never_saved = editor.is_new();
+        // The editor reports validation problems through the status bar.
+        if let Some(message) = message {
+            self.error(message);
+        }
+        match event {
+            EditorEvent::Changed => self.apply_editor(),
+            EditorEvent::Close => {
                 self.editor = None;
                 self.mode = Mode::List;
-                self.info("Cancelled");
-            }
-            None => {
-                // The editor reports validation problems through the status bar.
-                if let Some(error) = editor.error.clone() {
-                    self.error(error);
+                if never_saved {
+                    self.info("Nothing saved — a new host needs an alias first");
                 }
             }
+            EditorEvent::None => {}
         }
     }
 
-    /// Renders the editor back into the config and writes it out.
-    fn commit_editor(&mut self) {
+    /// Writes the editor's current state into the config and saves it.
+    fn apply_editor(&mut self) {
         let Some(editor) = self.editor.as_ref() else {
             return;
         };
         let existing = editor.target.map(|index| &self.config.blocks[index]);
-
         let block = match editor.to_block(existing) {
             Ok(block) => block,
             Err(message) => {
@@ -326,17 +519,19 @@ impl App {
         match editor.target {
             Some(index) => self.config.blocks[index] = block,
             None => {
+                // The first valid change to a new host is what creates it.
                 self.config.blocks.push(block);
+                let index = self.config.blocks.len() - 1;
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.target = Some(index);
+                }
                 // Reveal the new host even if the current filter would hide it.
                 self.filter.clear();
-                self.list_state.select(Some(self.config.blocks.len() - 1));
+                self.list_state.select(Some(index));
             }
         }
 
-        self.editor = None;
-        self.mode = Mode::List;
-        self.save();
-        if !matches!(self.status, Some((_, StatusKind::Error))) {
+        if self.persist(false) {
             self.info(format!("Saved {label}"));
         }
     }
@@ -377,9 +572,10 @@ Host web
     User deploy
 ";
 
-    /// An app backed by a scratch file, so `save()` exercises the real path.
+    /// An app backed by a scratch file, so saving exercises the real path.
     fn app_with(name: &str, text: &str) -> App {
         let dir = std::env::temp_dir().join(format!("sshconfig-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config");
         std::fs::write(&path, text).unwrap();
@@ -416,7 +612,7 @@ Host web
             .unwrap_or_else(|| panic!("no row labelled {label}"));
     }
 
-    /// Focuses a row, replaces its value and accepts it.
+    /// Focuses a row, replaces its value and presses enter.
     fn set_row(app: &mut App, label: &str, value: &str) {
         focus(app, label);
         app.on_key(key(KeyCode::Enter));
@@ -441,6 +637,19 @@ Host web
         }
     }
 
+    fn is_error(app: &App) -> bool {
+        app.status
+            .as_ref()
+            .is_some_and(|s| s.kind == StatusKind::Error)
+    }
+
+    fn status_text(app: &App) -> String {
+        app.status
+            .as_ref()
+            .map(|s| s.text.clone())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn navigation_wraps_and_tracks_selection() {
         let mut app = app_with("nav", SAMPLE);
@@ -462,7 +671,6 @@ Host web
         assert_eq!(app.selected().unwrap().label(), "web");
 
         app.on_key(key(KeyCode::Backspace));
-        press(&mut app, "");
         assert_eq!(app.filter, "deplo");
 
         app.on_key(key(KeyCode::Esc));
@@ -480,23 +688,83 @@ Host web
         assert!(app.selected_block().is_some());
     }
 
+    // --- saving as you go ------------------------------------------------
+
     #[test]
-    fn adding_a_host_writes_it_to_disk() {
+    fn each_change_is_written_as_soon_as_it_is_made() {
+        let mut app = app_with("autosave", SAMPLE);
+        press(&mut app, "je");
+
+        set_row(&mut app, "HostName", "10.0.0.9");
+        assert!(
+            read_back(&app).contains("    HostName 10.0.0.9"),
+            "saved without ctrl-s"
+        );
+        assert_eq!(app.mode, Mode::Edit, "and the editor stays open");
+        assert_eq!(status_text(&app), "Saved nas");
+
+        set_row(&mut app, "User", "root");
+        assert!(read_back(&app).contains("    User root"));
+    }
+
+    #[test]
+    fn ctrl_s_is_no_longer_needed_or_bound() {
+        let mut app = app_with("ctrl-s", SAMPLE);
+        press(&mut app, "je");
+        app.on_key(ctrl(KeyCode::Char('s')));
+        assert_eq!(app.mode, Mode::Edit);
+        assert_eq!(
+            read_back(&app),
+            SAMPLE,
+            "nothing changed, so nothing written"
+        );
+    }
+
+    #[test]
+    fn esc_leaves_the_editor_with_everything_already_saved() {
+        let mut app = app_with("esc", SAMPLE);
+        press(&mut app, "je");
+        set_row(&mut app, "HostName", "10.0.0.9");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            read_back(&app).contains("    HostName 10.0.0.9"),
+            "esc doesn't undo"
+        );
+    }
+
+    #[test]
+    fn a_new_host_is_created_by_giving_it_an_alias() {
         let mut app = app_with("add", SAMPLE);
         press(&mut app, "a");
         assert_eq!(app.mode, Mode::Edit);
+        assert!(
+            app.editor.as_ref().unwrap().inline.is_some(),
+            "typing the alias straight away"
+        );
 
-        set_row(&mut app, "Host", "db");
+        press(&mut app, "db");
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            read_back(&app).ends_with("Host db\n"),
+            "{}",
+            read_back(&app)
+        );
+
         set_row(&mut app, "HostName", "db.internal");
         set_row(&mut app, "User", "postgres");
-        app.on_key(ctrl(KeyCode::Char('s')));
-
-        assert_eq!(app.mode, Mode::List);
         let text = read_back(&app);
         assert!(
             text.ends_with("Host db\n    HostName db.internal\n    User postgres\n"),
             "{text}"
         );
+        assert_eq!(
+            text.matches("Host db").count(),
+            1,
+            "one host, not one per change"
+        );
+
+        app.on_key(key(KeyCode::Esc));
         assert_eq!(
             app.selected().unwrap().label(),
             "db",
@@ -505,88 +773,50 @@ Host web
     }
 
     #[test]
-    fn adding_a_port_forward_writes_the_directive_for_you() {
-        let mut app = app_with("forward", SAMPLE);
-        press(&mut app, "j"); // nas
-        press(&mut app, "e");
-
-        focus(&mut app, "+ add a port forward");
-        app.on_key(key(KeyCode::Enter));
-        app.on_key(key(KeyCode::Down)); // bind address
-        app.on_key(key(KeyCode::Down)); // listening port
-        press(&mut app, "5432");
-        app.on_key(key(KeyCode::Down)); // host
-        for _ in 0.."localhost".len() {
-            app.on_key(key(KeyCode::Backspace));
-        }
-        press(&mut app, "db.internal");
-        app.on_key(key(KeyCode::Down)); // destination port
-        press(&mut app, "5432");
-        app.on_key(key(KeyCode::Enter));
-        app.on_key(ctrl(KeyCode::Char('s')));
-
-        let text = read_back(&app);
-        assert!(
-            text.contains("    LocalForward 5432 db.internal:5432"),
-            "{text}"
-        );
-        assert!(
-            text.contains("    LocalForward 8081 127.0.0.1:8081"),
-            "existing forward kept"
-        );
+    fn abandoning_a_new_host_before_naming_it_writes_nothing() {
+        let mut app = app_with("abandon", SAMPLE);
+        press(&mut app, "a");
+        app.on_key(key(KeyCode::Esc)); // stop typing the alias
+        app.on_key(key(KeyCode::Esc)); // leave the editor
+        assert_eq!(app.mode, Mode::List);
+        assert_eq!(read_back(&app), SAMPLE);
+        assert!(status_text(&app).contains("Nothing saved"));
     }
 
     #[test]
-    fn adding_an_option_from_the_catalogue() {
-        let mut app = app_with("option", SAMPLE);
-        press(&mut app, "je");
-
-        focus(&mut app, "+ add an option");
+    fn an_empty_alias_is_refused_and_stays_editable() {
+        let mut app = app_with("empty", SAMPLE);
+        press(&mut app, "a");
         app.on_key(key(KeyCode::Enter));
-        press(&mut app, "ServerAliveInterval");
-        app.on_key(key(KeyCode::Enter));
-
-        // ServerAliveInterval takes a time, so the value is typed.
-        press(&mut app, "60");
-        app.on_key(key(KeyCode::Enter));
-        app.on_key(ctrl(KeyCode::Char('s')));
-
+        assert!(is_error(&app));
         assert!(
-            read_back(&app).contains("    ServerAliveInterval 60"),
-            "{}",
-            read_back(&app)
+            app.editor.as_ref().unwrap().inline.is_some(),
+            "still typing"
         );
+        assert_eq!(read_back(&app), SAMPLE);
     }
 
     #[test]
-    fn a_yes_no_option_is_chosen_from_a_list() {
-        let mut app = app_with("choice", SAMPLE);
+    fn a_bad_value_is_refused_before_it_reaches_the_file() {
+        let mut app = app_with("port", SAMPLE);
         press(&mut app, "je");
-
-        focus(&mut app, "+ add an option");
-        app.on_key(key(KeyCode::Enter));
-        press(&mut app, "Compression");
-        app.on_key(key(KeyCode::Enter)); // pick the keyword
-        app.on_key(key(KeyCode::Enter)); // accept the highlighted value
-        app.on_key(ctrl(KeyCode::Char('s')));
-
+        set_row(&mut app, "Port", "http");
+        assert!(is_error(&app));
+        assert!(status_text(&app).contains("Port"), "{}", status_text(&app));
         assert!(
-            read_back(&app).contains("    Compression yes"),
-            "{}",
-            read_back(&app)
+            app.editor.as_ref().unwrap().inline.is_some(),
+            "left in the box to fix"
         );
+        assert_eq!(read_back(&app), SAMPLE);
     }
 
     #[test]
     fn editing_preserves_directives_the_form_does_not_show() {
         let mut app = app_with("edit", SAMPLE);
-        press(&mut app, "j");
-        press(&mut app, "e");
+        press(&mut app, "je");
         set_row(&mut app, "HostName", "10.0.0.9");
-        app.on_key(ctrl(KeyCode::Char('s')));
 
         let text = read_back(&app);
-        assert!(text.contains("    HostName 10.0.0.9"));
         assert!(
             text.contains("    LocalForward 8081 127.0.0.1:8081"),
             "forward kept: {text}"
@@ -602,58 +832,206 @@ Host web
     }
 
     #[test]
-    fn escaping_the_form_discards_changes() {
-        let mut app = app_with("cancel", SAMPLE);
+    fn adding_a_port_forward_writes_the_directive_for_you() {
+        let mut app = app_with("forward", SAMPLE);
         press(&mut app, "je");
-        set_row(&mut app, "HostName", "wrong.example.com");
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.mode, Mode::List);
-        assert_eq!(read_back(&app), SAMPLE, "file untouched");
-    }
+        press(&mut app, "a"); // add a forward from anywhere
+        app.on_key(key(KeyCode::Down)); // bind address
+        app.on_key(key(KeyCode::Down)); // listening port
+        press(&mut app, "5432");
+        app.on_key(key(KeyCode::Down)); // host
+        for _ in 0.."localhost".len() {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        press(&mut app, "db.internal");
+        app.on_key(key(KeyCode::Down)); // destination port
+        press(&mut app, "5432");
+        app.on_key(key(KeyCode::Enter));
 
-    #[test]
-    fn an_empty_alias_is_rejected_and_keeps_the_form_open() {
-        let mut app = app_with("empty", SAMPLE);
-        press(&mut app, "a");
-        app.on_key(ctrl(KeyCode::Char('s')));
-        assert_eq!(app.mode, Mode::Edit);
-        assert!(matches!(app.status, Some((_, StatusKind::Error))));
-        assert_eq!(read_back(&app), SAMPLE);
-    }
-
-    #[test]
-    fn a_non_numeric_port_is_rejected() {
-        let mut app = app_with("port", SAMPLE);
-        press(&mut app, "je");
-        set_row(&mut app, "Port", "http");
-        app.on_key(ctrl(KeyCode::Char('s')));
-
-        assert_eq!(
-            app.mode,
-            Mode::Edit,
-            "the editor stays open so it can be fixed"
+        let text = read_back(&app);
+        assert!(
+            text.contains("    LocalForward 5432 db.internal:5432"),
+            "{text}"
         );
-        assert!(matches!(app.status, Some((_, StatusKind::Error))));
-        assert_eq!(read_back(&app), SAMPLE);
+        assert!(
+            text.contains("    LocalForward 8081 127.0.0.1:8081"),
+            "existing forward kept"
+        );
     }
 
     #[test]
-    fn delete_asks_first_and_only_removes_the_selected_host() {
+    fn space_switches_a_forward_off_and_on_by_commenting_it_out() {
+        let mut app = app_with("toggle", SAMPLE);
+        press(&mut app, "je");
+        focus(&mut app, "local");
+
+        press(&mut app, " ");
+        let text = read_back(&app);
+        assert!(
+            text.contains("    # LocalForward 8081 127.0.0.1:8081"),
+            "{text}"
+        );
+        assert!(!text.contains("    LocalForward 8081"), "no live copy left");
+
+        press(&mut app, " ");
+        let text = read_back(&app);
+        assert!(
+            text.contains("    LocalForward 8081 127.0.0.1:8081"),
+            "{text}"
+        );
+        assert!(!text.contains("# LocalForward"), "{text}");
+    }
+
+    #[test]
+    fn a_forward_commented_out_by_hand_can_be_switched_on() {
+        let text = SAMPLE.replace("    LocalForward 8081", "    #LocalForward 8081");
+        let mut app = app_with("by-hand", &text);
+        press(&mut app, "je");
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.forwards.len(), 1);
+        assert!(!editor.forwards[0].enabled);
+
+        focus(&mut app, "local");
+        press(&mut app, " ");
+        assert!(read_back(&app).contains("    LocalForward 8081 127.0.0.1:8081"));
+    }
+
+    #[test]
+    fn adding_an_option_from_the_catalogue() {
+        let mut app = app_with("option", SAMPLE);
+        press(&mut app, "je");
+        focus(&mut app, "+ add an option");
+        app.on_key(key(KeyCode::Enter));
+        press(&mut app, "ServerAliveInterval");
+        app.on_key(key(KeyCode::Enter));
+        press(&mut app, "60"); // takes a time, so the value is typed
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(
+            read_back(&app).contains("    ServerAliveInterval 60"),
+            "{}",
+            read_back(&app)
+        );
+    }
+
+    #[test]
+    fn a_yes_no_option_is_chosen_from_a_list() {
+        let mut app = app_with("choice", SAMPLE);
+        press(&mut app, "je");
+        focus(&mut app, "+ add an option");
+        app.on_key(key(KeyCode::Enter));
+        press(&mut app, "Compression");
+        app.on_key(key(KeyCode::Enter)); // pick the keyword
+        app.on_key(key(KeyCode::Enter)); // accept the highlighted value
+
+        assert!(
+            read_back(&app).contains("    Compression yes"),
+            "{}",
+            read_back(&app)
+        );
+    }
+
+    // --- dangerous actions ask first -------------------------------------
+
+    #[test]
+    fn deleting_a_host_asks_first() {
         let mut app = app_with("delete", SAMPLE);
         press(&mut app, "j");
 
         press(&mut app, "d");
-        assert_eq!(app.mode, Mode::ConfirmDelete);
+        assert_eq!(app.mode, Mode::Confirm);
         press(&mut app, "n");
+        assert_eq!(app.mode, Mode::List);
         assert_eq!(read_back(&app), SAMPLE, "declining changes nothing");
 
-        press(&mut app, "d");
-        press(&mut app, "y");
+        press(&mut app, "dy");
         let text = read_back(&app);
         assert!(!text.contains("Host nas"));
         assert!(!text.contains("# the NAS"), "the host's label goes with it");
         assert!(text.contains("Host web"));
         assert!(text.contains("Host *"));
+    }
+
+    #[test]
+    fn removing_a_row_in_the_editor_asks_first() {
+        let mut app = app_with("remove-row", SAMPLE);
+        press(&mut app, "je");
+        focus(&mut app, "local");
+
+        press(&mut app, "d");
+        press(&mut app, "n");
+        assert_eq!(read_back(&app), SAMPLE, "declining keeps it");
+
+        press(&mut app, "dy");
+        assert!(!read_back(&app).contains("LocalForward"));
+    }
+
+    #[test]
+    fn an_edit_made_elsewhere_is_never_silently_overwritten() {
+        let mut app = app_with("conflict", SAMPLE);
+        let theirs = format!("{SAMPLE}\nHost added-in-vim\n");
+        std::fs::write(&app.config.path, &theirs).unwrap();
+
+        press(&mut app, "je");
+        set_row(&mut app, "HostName", "10.0.0.9");
+        assert_eq!(app.mode, Mode::Confirm, "asks what to do");
+        assert_eq!(read_back(&app), theirs, "their edit is still there");
+
+        // Dismissing it keeps both: theirs on disk, ours in memory.
+        press(&mut app, "x");
+        assert_eq!(app.mode, Mode::Edit);
+        assert_eq!(read_back(&app), theirs);
+        assert!(app.unsaved);
+    }
+
+    #[test]
+    fn a_conflict_can_be_resolved_by_overwriting() {
+        let mut app = app_with("overwrite", SAMPLE);
+        std::fs::write(&app.config.path, "Host theirs\n").unwrap();
+        press(&mut app, "je");
+        set_row(&mut app, "HostName", "10.0.0.9");
+        press(&mut app, "o");
+
+        let text = read_back(&app);
+        assert!(text.contains("HostName 10.0.0.9"));
+        assert!(!text.contains("Host theirs"));
+        assert!(!app.unsaved);
+    }
+
+    #[test]
+    fn a_conflict_can_be_resolved_by_taking_theirs() {
+        let mut app = app_with("theirs", SAMPLE);
+        std::fs::write(&app.config.path, "Host theirs\n").unwrap();
+        press(&mut app, "je");
+        set_row(&mut app, "HostName", "10.0.0.9");
+        press(&mut app, "r");
+
+        assert_eq!(
+            app.mode,
+            Mode::List,
+            "the editor closes: its host may be gone"
+        );
+        assert_eq!(read_back(&app), "Host theirs\n");
+        assert_eq!(app.config.blocks[0].label(), "theirs");
+    }
+
+    #[test]
+    fn quitting_with_unsaved_changes_asks_first() {
+        let mut app = app_with("quit", SAMPLE);
+        press(&mut app, "q");
+        assert!(app.should_quit, "nothing to lose, so no question");
+
+        let mut app = app_with("quit-unsaved", SAMPLE);
+        std::fs::write(&app.config.path, "Host theirs\n").unwrap();
+        press(&mut app, "je");
+        set_row(&mut app, "HostName", "10.0.0.9");
+        press(&mut app, "x"); // leave the conflict for later
+        app.on_key(key(KeyCode::Esc)); // out of the editor
+        press(&mut app, "q");
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Confirm);
+        press(&mut app, "y");
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -667,11 +1045,63 @@ Host web
     }
 
     #[test]
+    fn the_backup_is_the_file_from_before_the_session() {
+        let mut app = app_with("backup", SAMPLE);
+        press(&mut app, "je");
+        set_row(&mut app, "HostName", "one");
+        set_row(&mut app, "HostName", "two");
+        set_row(&mut app, "HostName", "three");
+        assert_eq!(
+            std::fs::read_to_string(app.config.backup_path()).unwrap(),
+            SAMPLE
+        );
+    }
+
+    // --- status messages -------------------------------------------------
+
+    #[test]
+    fn messages_clear_themselves_after_a_couple_of_seconds() {
+        let mut app = app_with("expire", SAMPLE);
+        press(&mut app, "r");
+        assert_eq!(status_text(&app), "Reloaded from disk");
+        let shown = app.status.as_ref().unwrap().shown_at;
+
+        assert!(
+            !app.expire_status(shown + Duration::from_millis(1900)),
+            "still showing"
+        );
+        assert!(app.status.is_some());
+        assert!(app.expire_status(shown + Duration::from_millis(2000)));
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn errors_stay_up_a_little_longer() {
+        let mut app = app_with("expire-error", SAMPLE);
+        press(&mut app, "l"); // "*" can't be connected to
+        assert!(is_error(&app));
+        let shown = app.status.as_ref().unwrap().shown_at;
+        assert!(!app.expire_status(shown + Duration::from_secs(3)));
+        assert!(app.expire_status(shown + ERROR_TTL));
+    }
+
+    #[test]
+    fn the_event_loop_is_told_when_to_wake_for_the_next_expiry() {
+        let mut app = app_with("deadline", SAMPLE);
+        assert!(app.status_deadline().is_none(), "nothing to wait for");
+        press(&mut app, "r");
+        let shown = app.status.as_ref().unwrap().shown_at;
+        assert_eq!(app.status_deadline(), Some(shown + INFO_TTL));
+    }
+
+    // --- everything else ------------------------------------------------
+
+    #[test]
     fn connecting_is_refused_for_wildcard_entries() {
         let mut app = app_with("connect", SAMPLE);
         press(&mut app, "l");
         assert!(app.connect_to.is_none());
-        assert!(matches!(app.status, Some((_, StatusKind::Error))));
+        assert!(is_error(&app));
 
         press(&mut app, "jl");
         assert_eq!(app.connect_to.as_deref(), Some("nas"));
@@ -684,7 +1114,7 @@ Host web
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::Edit);
         assert_eq!(app.editor.as_ref().unwrap().alias, "nas");
-        assert!(app.connect_to.is_none(), "enter no longer connects");
+        assert!(app.connect_to.is_none(), "enter doesn't connect");
     }
 
     #[test]
@@ -692,7 +1122,7 @@ Host web
         let mut app = app_with("match", "Match host bastion\n    ForwardAgent yes\n");
         press(&mut app, "e");
         assert_eq!(app.mode, Mode::List);
-        assert!(matches!(app.status, Some((_, StatusKind::Error))));
+        assert!(is_error(&app));
     }
 
     #[test]
@@ -700,11 +1130,7 @@ Host web
         let mut app = app_with("blank", "");
         assert!(app.selected().is_none());
         press(&mut app, "d");
-        assert_eq!(
-            app.mode,
-            Mode::List,
-            "delete with nothing selected is a no-op"
-        );
+        assert_eq!(app.mode, Mode::List, "nothing to delete, so no question");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::List, "nothing to edit");
         press(&mut app, "l");

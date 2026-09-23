@@ -4,6 +4,12 @@
 //! `RemoteForward [bind:]port host:hostport` and `DynamicForward [bind:]port`,
 //! with unix-socket paths allowed in place of either side. We parse the common
 //! TCP shapes and hand anything stranger back as raw text.
+//!
+//! A forward can be switched off without losing it: it is written commented
+//! out (`# LocalForward …`), which is also how people disable one by hand, so
+//! hand-commented forwards are picked up as switched-off ones.
+
+use crate::config::split_directive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardKind {
@@ -79,6 +85,8 @@ pub struct Forward {
     /// Where traffic comes out. Empty for [`ForwardKind::Dynamic`].
     pub host: String,
     pub port: String,
+    /// Switched-off forwards are kept in the file as a comment.
+    pub enabled: bool,
 }
 
 impl Forward {
@@ -93,6 +101,7 @@ impl Forward {
                 "localhost".into()
             },
             port: String::new(),
+            enabled: true,
         }
     }
 
@@ -110,15 +119,18 @@ impl Forward {
             _ => return None,
         };
 
+        // Ports must be numbers, as ssh's own a2port() requires. That also
+        // rules out unix sockets, and keeps prose like "# LocalForward for
+        // the database" from being read as a forward.
         let (bind, listen) = split_host_port(listen_part);
-        if listen.is_empty() || listen.contains('/') {
-            return None; // a unix socket, or nothing we understand
+        if !is_port(&listen) {
+            return None;
         }
 
         let (host, port) = match dest {
             Some(dest) => {
                 let (host, port) = split_host_port(&dest);
-                if host.is_empty() || port.is_empty() || dest.contains('/') {
+                if host.is_empty() || !is_port(&port) || dest.contains('/') {
                     return None;
                 }
                 (host, port)
@@ -132,7 +144,27 @@ impl Forward {
             listen,
             host,
             port,
+            enabled: true,
         })
+    }
+
+    /// Reads a commented-out forward, e.g. `# LocalForward 8081 localhost:8081`,
+    /// as a switched-off one. Prose comments don't parse and give `None`.
+    pub fn parse_disabled(comment: &str) -> Option<Self> {
+        let body = comment.trim().strip_prefix('#')?.trim_start_matches('#');
+        let (keyword, value) = split_directive(body)?;
+        let mut forward = Forward::parse(keyword, value)?;
+        forward.enabled = false;
+        Some(forward)
+    }
+
+    /// The line as it goes in the file: the directive, or a comment when off.
+    pub fn file_line(&self) -> String {
+        if self.enabled {
+            self.line()
+        } else {
+            format!("# {}", self.line())
+        }
     }
 
     /// The value part of the directive, e.g. `127.0.0.1:8081 localhost:8081`.
@@ -254,6 +286,14 @@ mod tests {
     }
 
     #[test]
+    fn ports_must_be_numbers() {
+        assert!(parse("LocalForward http localhost:80").is_none());
+        assert!(parse("LocalForward 8080 localhost:http").is_none());
+        assert!(parse("LocalForward 70000 localhost:80").is_none());
+        assert!(parse("DynamicForward socks").is_none());
+    }
+
+    #[test]
     fn declines_unix_sockets_and_nonsense() {
         assert!(parse("LocalForward /tmp/mysql.sock /var/run/mysqld.sock").is_none());
         assert!(parse("LocalForward 8080").is_none());
@@ -270,6 +310,45 @@ mod tests {
         assert!(forward.is_complete());
         forward.port = "not-a-port".into();
         assert!(!forward.is_complete());
+    }
+
+    #[test]
+    fn a_switched_off_forward_is_written_as_a_comment() {
+        let mut forward = parse("LocalForward 8081 127.0.0.1:8081").unwrap();
+        forward.enabled = false;
+        assert_eq!(forward.file_line(), "# LocalForward 8081 127.0.0.1:8081");
+
+        let back = Forward::parse_disabled(&forward.file_line()).unwrap();
+        assert_eq!(
+            back, forward,
+            "reading it back gives the same, still-off forward"
+        );
+    }
+
+    #[test]
+    fn picks_up_forwards_commented_out_by_hand() {
+        for comment in [
+            "# LocalForward 8081 127.0.0.1:8081",
+            "#LocalForward 8081 127.0.0.1:8081",
+            "## DynamicForward 1080",
+            "#   RemoteForward 8080 localhost:3000",
+        ] {
+            let forward = Forward::parse_disabled(comment)
+                .unwrap_or_else(|| panic!("{comment} should read as a forward"));
+            assert!(!forward.enabled);
+        }
+    }
+
+    #[test]
+    fn leaves_prose_comments_alone() {
+        for comment in [
+            "# LocalForward for the database",
+            "# forwards the NAS web UI",
+            "# LocalForward 8080 db:5432 was flaky, removed",
+            "not a comment at all",
+        ] {
+            assert!(Forward::parse_disabled(comment).is_none(), "{comment}");
+        }
     }
 
     #[test]

@@ -108,6 +108,13 @@ KIND_MAP = {
 
 PATH_LIKE = re.compile(r"(File|Path|Agent|KnownHosts)")
 
+# Where the parse_* heuristic gets the type wrong. RekeyLimit is a data size
+# with an optional time after it ("1G 1h"); its case only jumps to parse_time
+# for that second argument.
+KIND_OVERRIDES = {
+    "RekeyLimit": "Text",
+}
+
 
 def source(name, local):
     if local:
@@ -231,7 +238,7 @@ def main():
             continue
         name, body = entries[lower]
         label, values = kinds.get(opcode, ("parse_string", []))
-        kind = KIND_MAP[label]
+        kind = KIND_OVERRIDES.get(name, KIND_MAP[label])
         if kind == "Text" and PATH_LIKE.search(name):
             kind = "Path"
         if kind == "Flag":

@@ -1,16 +1,21 @@
 //! All drawing. Colours stick to the 16 ANSI slots plus a couple of indexed
 //! greys so the TUI inherits whatever theme the user's terminal already has.
+//!
+//! The layout follows the terminal's size. With room, the host list and the
+//! details sit side by side; narrower, the details move under the list; when
+//! both width and height are tight, the list is shown alone. Dialogs float
+//! in the middle when there is space around them and take the whole screen
+//! when there isn't. Text that doesn't fit is cut with "…" rather than wrapped
+//! into the next column.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block as Border, BorderType, Clear, List, ListItem, Padding, Paragraph, Wrap,
-};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block as Border, BorderType, Clear, List, ListItem, Padding, Paragraph};
 
 use crate::app::{App, Mode, StatusKind};
-use crate::config::{BlockKind, split_directive};
+use crate::config::{BlockKind, display_path, split_directive};
 use crate::editor::{Editor, ForwardForm, Overlay, Row};
 use crate::forward::{Forward, ForwardKind};
 use crate::schema::Kind;
@@ -18,29 +23,68 @@ use crate::schema::Kind;
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
 
+/// Below this there isn't room for anything useful, so we say so instead.
+pub const MIN_WIDTH: u16 = 36;
+pub const MIN_HEIGHT: u16 = 10;
+/// From this width the details pane sits beside the list...
+const SIDE_BY_SIDE_WIDTH: u16 = 72;
+/// ...and below it, under the list, if the body is at least this tall.
+const STACKED_HEIGHT: u16 = 20;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        draw_too_small(frame, area);
+        return;
+    }
+
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(3),
+        Constraint::Min(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
     draw_header(frame, app, header);
 
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).areas(body);
-    draw_list(frame, app, left);
-    draw_details(frame, app, right);
-
-    draw_footer(frame, app, footer);
+    // A confirm dialog opened from the editor sits over the editor.
+    if app.editor.is_some() && matches!(app.mode, Mode::Edit | Mode::Confirm) {
+        draw_editor(frame, app, body);
+    } else {
+        draw_hosts(frame, app, body);
+    }
 
     match app.mode {
-        Mode::Edit => draw_editor(frame, app, frame.area()),
-        Mode::ConfirmDelete => draw_confirm(frame, app, frame.area()),
-        Mode::Help => draw_help(frame, frame.area()),
+        Mode::Confirm => draw_confirm(frame, app, body),
+        Mode::Help => draw_help(frame, body),
         _ => {}
     }
+
+    draw_footer(frame, app, footer);
+}
+
+fn draw_too_small(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::styled("sshconfig", Style::new().fg(ACCENT).bold()),
+        Line::styled(
+            format!("needs {MIN_WIDTH}×{MIN_HEIGHT}"),
+            Style::new().fg(Color::Gray),
+        ),
+        Line::styled(
+            format!("this is {}×{}", area.width, area.height),
+            Style::new().fg(MUTED),
+        ),
+    ];
+    let top = area.height.saturating_sub(lines.len() as u16) / 2;
+    let area = Rect {
+        y: area.y + top,
+        height: area.height - top,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+        area,
+    );
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -50,23 +94,50 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter(|b| b.kind == BlockKind::Host)
         .count();
-    let line = Line::from(vec![
-        Span::styled(
-            " sshconfig ",
-            Style::new().fg(Color::Black).bg(ACCENT).bold(),
-        ),
+    let title = " sshconfig ";
+    let count = format!("  {hosts} host{}", if hosts == 1 { "" } else { "s" });
+
+    let mut spans = vec![
+        Span::styled(title, Style::new().fg(Color::Black).bg(ACCENT).bold()),
         Span::raw(" "),
-        Span::styled(
-            app.config.path.display().to_string(),
+    ];
+    let room = (area.width as usize).saturating_sub(title.len() + 1 + count.len());
+    // A path cut down to a few characters says nothing; drop it instead.
+    if room >= 8 {
+        spans.push(Span::styled(
+            truncate_left(&display_path(&app.config.path), room),
             Style::new().fg(MUTED),
-        ),
-        Span::styled(format!("  {hosts} hosts"), Style::new().fg(MUTED)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+        ));
+    }
+    spans.push(Span::styled(count, Style::new().fg(MUTED)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The host list, with the details pane beside it, under it, or not at all.
+fn draw_hosts(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width >= SIDE_BY_SIDE_WIDTH {
+        let list_width = (area.width * 38 / 100).clamp(26, 48);
+        let [left, right] =
+            Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(area);
+        draw_list(frame, app, left);
+        draw_details(frame, app, right);
+    } else if area.height >= STACKED_HEIGHT {
+        let wanted = app.visible().len() as u16 + 2;
+        let list_height = wanted.clamp(5, area.height / 2);
+        let [top, bottom] =
+            Layout::vertical([Constraint::Length(list_height), Constraint::Min(0)]).areas(area);
+        draw_list(frame, app, top);
+        draw_details(frame, app, bottom);
+    } else {
+        draw_list(frame, app, area);
+    }
 }
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible();
+    // The border takes two columns and the marker three.
+    let room = (area.width as usize).saturating_sub(5);
+
     let items: Vec<ListItem> = visible
         .iter()
         .map(|i| {
@@ -76,17 +147,28 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 BlockKind::Host if block.is_pattern() => ("*", Style::new().fg(Color::Yellow)),
                 BlockKind::Host => ("●", Style::new().fg(Color::Green)),
             };
+            let label = truncate(&block.label(), room);
+            let mut spans = vec![
+                Span::styled(format!(" {marker} "), marker_style),
+                Span::styled(label.clone(), Style::new().bold()),
+            ];
+
+            // user@host goes after the alias only while there's space for
+            // enough of it to be recognisable.
             let target = match (block.get("User"), block.get("HostName")) {
                 (Some(user), Some(host)) => format!("{user}@{host}"),
                 (None, Some(host)) => host,
                 _ => String::new(),
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {marker} "), marker_style),
-                Span::styled(block.label(), Style::new().bold()),
-                Span::raw("  "),
-                Span::styled(target, Style::new().fg(MUTED)),
-            ]))
+            let target_room = room.saturating_sub(width(&label) + 2);
+            if !target.is_empty() && target_room >= 6 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    truncate(&target, target_room),
+                    Style::new().fg(MUTED),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -108,200 +190,327 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
+    let border = bordered(" Details ".into(), false).padding(Padding::horizontal(1));
+    let inner = border.inner(area);
+    frame.render_widget(border, area);
+    let room = inner.width as usize;
+
     let Some(block) = app.selected() else {
-        let hint = Text::from(vec![
-            Line::raw(""),
-            Line::styled("  No hosts yet.", Style::new().fg(MUTED)),
-            Line::styled("  Press a to add one.", Style::new().fg(MUTED)),
-        ]);
         frame.render_widget(
-            Paragraph::new(hint).block(bordered(" Details ".into(), false)),
-            area,
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::styled(truncate("No hosts yet.", room), Style::new().fg(MUTED)),
+                Line::styled(
+                    truncate("Press a to add one.", room),
+                    Style::new().fg(MUTED),
+                ),
+            ]),
+            inner,
         );
         return;
     };
 
     let mut lines = vec![Line::from(vec![
         Span::styled("Host  ", Style::new().fg(MUTED)),
-        Span::styled(block.patterns().join(" "), Style::new().fg(ACCENT).bold()),
+        Span::styled(
+            truncate(&block.patterns().join(" "), room.saturating_sub(6)),
+            Style::new().fg(ACCENT).bold(),
+        ),
     ])];
     for comment in &block.leading {
         lines.push(Line::styled(
-            comment.trim().to_string(),
+            truncate(comment.trim(), room),
             Style::new().fg(MUTED).italic(),
         ));
     }
     lines.push(Line::raw(""));
 
-    if block.body.is_empty() {
-        lines.push(Line::styled("  (no options)", Style::new().fg(MUTED)));
+    // (label, value, label colour, whether the row is switched off)
+    enum Entry {
+        Pair(String, String, Color, bool),
+        Note(String),
     }
-    for raw in &block.body {
-        lines.push(match split_directive(raw) {
+    let entries: Vec<Entry> = block
+        .body
+        .iter()
+        .map(|raw| match split_directive(raw) {
             // Forwards read better as what they do than as their arguments.
-            Some((key, value)) if Forward::parse(key, value).is_some() => {
-                let forward = Forward::parse(key, value).unwrap();
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("{:<18}", forward.kind.label()),
-                        Style::new().fg(Color::Magenta),
-                    ),
-                    Span::raw(forward.describe()),
-                ])
-            }
-            Some((key, value)) => Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("{key:<18}"), Style::new().fg(Color::Blue)),
-                Span::raw(value.to_string()),
+            Some((key, value)) => match Forward::parse(key, value) {
+                Some(forward) => Entry::Pair(
+                    forward.kind.label().into(),
+                    forward.describe(),
+                    Color::Magenta,
+                    false,
+                ),
+                None => Entry::Pair(key.into(), value.into(), Color::Blue, false),
+            },
+            None => match Forward::parse_disabled(raw) {
+                Some(forward) => Entry::Pair(
+                    forward.kind.label().into(),
+                    format!("{}  off", forward.describe()),
+                    MUTED,
+                    true,
+                ),
+                None => Entry::Note(raw.trim().to_string()),
+            },
+        })
+        .collect();
+
+    // Labels get the space they need, up to a third of the pane.
+    let longest = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Pair(label, ..) => Some(width(label)),
+            Entry::Note(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let label_width = longest.min((room / 3).max(6));
+    let value_room = room.saturating_sub(label_width + 2);
+
+    if entries.is_empty() {
+        lines.push(Line::styled("(no options)", Style::new().fg(MUTED)));
+    }
+    for entry in entries {
+        lines.push(match entry {
+            Entry::Pair(label, value, colour, off) => Line::from(vec![
+                Span::styled(
+                    pad(&truncate(&label, label_width), label_width + 2),
+                    Style::new().fg(colour),
+                ),
+                Span::styled(
+                    truncate(&value, value_room),
+                    if off {
+                        Style::new().fg(MUTED)
+                    } else {
+                        Style::new()
+                    },
+                ),
             ]),
-            // Comments and blank lines, shown as-is.
-            None => Line::styled(format!("  {}", raw.trim()), Style::new().fg(MUTED).italic()),
+            Entry::Note(text) => {
+                Line::styled(truncate(&text, room), Style::new().fg(MUTED).italic())
+            }
         });
     }
 
     if block.kind == BlockKind::Host && !block.is_pattern() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("  l ", Style::new().fg(Color::Green)),
-            Span::styled(format!("ssh {}", block.label()), Style::new().fg(MUTED)),
+            Span::styled("l ", Style::new().fg(Color::Green)),
+            Span::styled(
+                truncate(&format!("ssh {}", block.label()), room.saturating_sub(2)),
+                Style::new().fg(MUTED),
+            ),
         ]));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(bordered(" Details ".into(), false).padding(Padding::horizontal(1)))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let room = area.width as usize;
+
     if app.mode == Mode::Search {
+        let hint = "   ↵ accept · esc clear";
+        let filter_room = room.saturating_sub(3 + hint.len());
         let line = Line::from(vec![
             Span::styled(" /", Style::new().fg(ACCENT).bold()),
-            Span::raw(app.filter.clone()),
+            Span::raw(truncate_left(&app.filter, filter_room)),
             Span::styled("▌", Style::new().fg(ACCENT)),
-            Span::styled("   ↵ accept · esc clear", Style::new().fg(MUTED)),
+            Span::styled(if room > 30 { hint } else { "" }, Style::new().fg(MUTED)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
 
-    if let Some((message, kind)) = &app.status {
-        let style = match kind {
+    if let Some(status) = &app.status {
+        let style = match status.kind {
             StatusKind::Info => Style::new().fg(Color::Green),
             StatusKind::Error => Style::new().fg(Color::Red).bold(),
         };
         frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {message}"), style)),
+            Paragraph::new(Line::styled(
+                format!(" {}", truncate(&status.text, room.saturating_sub(1))),
+                style,
+            )),
             area,
         );
         return;
     }
 
-    let keys = [
-        ("l", "login"),
-        ("↵", "edit"),
-        ("a", "add"),
-        ("d", "delete"),
-        ("y", "dup"),
-        ("/", "search"),
-        ("r", "reload"),
-        ("?", "help"),
-        ("q", "quit"),
-    ];
-    let mut spans = vec![Span::raw(" ")];
-    for (key, label) in keys {
-        spans.push(Span::styled(key, Style::new().fg(ACCENT).bold()));
-        spans.push(Span::styled(format!(" {label}  "), Style::new().fg(MUTED)));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let (keys, pinned): (Vec<Hint>, Option<Hint>) = match app.mode {
+        Mode::Edit => editor_hints(app.editor.as_ref()),
+        Mode::Confirm => (vec![("any other key", "cancel")], None),
+        Mode::Help => (vec![("any key", "close")], None),
+        _ => (
+            vec![
+                ("l", "login"),
+                ("↵", "edit"),
+                ("a", "add"),
+                ("d", "delete"),
+                ("/", "search"),
+                ("y", "dup"),
+                ("r", "reload"),
+                ("q", "quit"),
+            ],
+            Some(("?", "help")),
+        ),
+    };
+    frame.render_widget(Paragraph::new(fit_hints(&keys, pinned, room)), area);
 }
 
-/// The host editor: a scrolling list of rows, with overlays on top.
+type Hint = (&'static str, &'static str);
+
+/// The keys that do something right now in the editor, and the one that
+/// must never be squeezed out: how to get back.
+fn editor_hints(editor: Option<&Editor>) -> (Vec<Hint>, Option<Hint>) {
+    let Some(editor) = editor else {
+        return (Vec::new(), None);
+    };
+    if editor.inline.is_some() {
+        return (vec![("↵", "accept")], Some(("esc", "discard")));
+    }
+    let keys = match &editor.overlay {
+        Some(Overlay::Picker(_)) => vec![("↵", "add"), ("↑↓", "move")],
+        Some(Overlay::Choice(_)) => vec![("↵", "choose"), ("↑↓", "move")],
+        Some(Overlay::Forward(_)) => vec![("↵", "done"), ("↑↓", "field"), ("←→", "direction")],
+        Some(Overlay::ConfirmRemove(_)) => {
+            return (vec![("y", "remove")], Some(("any other key", "keep")));
+        }
+        None => {
+            let mut keys = vec![("↵", "edit")];
+            match editor.current_row() {
+                Row::Forward(i) if editor.forwards[i].enabled => keys.push(("space", "switch off")),
+                Row::Forward(_) => keys.push(("space", "switch on")),
+                row if editor
+                    .help_for_cursor()
+                    .is_some_and(|k| k.values == ["yes", "no"])
+                    && row != Row::Alias =>
+                {
+                    keys.push(("space", "toggle"))
+                }
+                _ => {}
+            }
+            keys.extend([("a", "add forward"), ("d", "remove")]);
+            return (keys, Some(("esc", "done")));
+        }
+    };
+    (keys, Some(("esc", "back")))
+}
+
+/// The host editor: a scrolling list of rows, with dialogs on top. It takes
+/// the whole body — it's a screen of its own, not a popup over the list.
 fn draw_editor(frame: &mut Frame, app: &App, area: Rect) {
     let Some(editor) = app.editor.as_ref() else {
         return;
     };
-
-    let popup = centered(78, area.height.saturating_sub(2), area);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Clear, area);
 
     let title = if editor.is_new() {
-        " New host "
+        " New host ".to_string()
     } else {
-        " Edit host "
+        format!(
+            " Edit {} ",
+            truncate(&editor.alias, (area.width as usize).saturating_sub(12))
+        )
     };
-    let outer = bordered(title.into(), true).padding(Padding::horizontal(1));
-    let inner = outer.inner(popup);
-    frame.render_widget(outer, popup);
+    let outer = bordered(title, true).padding(Padding::horizontal(1));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
 
-    let [list_area, help_area, keys_area] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(2),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-
-    draw_editor_rows(frame, editor, list_area);
-
-    // A line of prose about whatever the cursor is on, so the option names are
-    // not something you have to already know.
-    let help = match editor.help_for_cursor() {
-        Some(keyword) => {
-            let mut spans = vec![Span::styled(keyword.desc, Style::new().fg(Color::Gray))];
-            if let Some(default) = keyword.default {
-                spans.push(Span::styled(
-                    format!(" (default: {default})"),
-                    Style::new().fg(MUTED).italic(),
-                ));
-            }
-            Line::from(spans)
-        }
-        None => Line::styled(
-            match editor.current_row() {
-                Row::Alias => {
-                    "The name you type after ssh. Space-separate to give a host several aliases."
-                }
-                Row::Forward(_) | Row::AddForward => "Tunnel a port through this connection.",
-                Row::AddOption => "Search all 99 ssh_config options by name or description.",
-                _ => "",
-            },
-            Style::new().fg(Color::Gray),
-        ),
+    // A line or two of prose about whatever the cursor is on, so option names
+    // aren't something you have to already know. Dropped when space is short.
+    let prose_height = match inner.height {
+        16.. => 2,
+        10.. => 1,
+        _ => 0,
     };
-    frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: true }), help_area);
+    let [rows_area, prose_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(prose_height)]).areas(inner);
 
-    let keys: &[(&str, &str)] = if editor.inline.is_some() {
-        &[("↵", "accept"), ("esc", "discard"), ("^s", "save host")]
-    } else {
-        &[
-            ("↵", "edit"),
-            ("a", "add forward"),
-            ("space", "toggle"),
-            ("d", "remove"),
-            ("^s", "save"),
-            ("esc", "cancel"),
-        ]
-    };
-    frame.render_widget(Paragraph::new(key_hints(keys)), keys_area);
+    draw_editor_rows(frame, editor, rows_area);
+    if prose_height > 0 {
+        draw_prose(frame, editor, prose_area);
+    }
 
     match &editor.overlay {
         Some(Overlay::Picker(_)) => draw_picker(frame, editor, area),
         Some(Overlay::Choice(_)) => draw_choice(frame, editor, area),
         Some(Overlay::Forward(_)) => draw_forward_form(frame, editor, area),
+        Some(Overlay::ConfirmRemove(row)) => draw_confirm_box(
+            frame,
+            area,
+            " Remove ",
+            &format!(
+                "Remove {}? It is taken out of the file straight away.",
+                editor.describe_row(*row)
+            ),
+            &[('y', "remove")],
+        ),
         None => {}
     }
+}
+
+fn draw_prose(frame: &mut Frame, editor: &Editor, area: Rect) {
+    let text = match editor.help_for_cursor() {
+        Some(keyword) => match keyword.default {
+            Some(default) => format!("{} (default: {default})", keyword.desc),
+            None => keyword.desc.to_string(),
+        },
+        None => match editor.current_row() {
+            Row::Alias => {
+                "The name you type after ssh. Space-separate to give a host several aliases.".into()
+            }
+            Row::Forward(i) if !editor.forwards[i].enabled => {
+                "Switched off: kept in the file as a comment. Space switches it back on.".into()
+            }
+            Row::Forward(_) | Row::AddForward => "Tunnel a port through this connection.".into(),
+            Row::AddOption => "Search all 99 ssh_config options by name or description.".into(),
+            _ => String::new(),
+        },
+    };
+    let lines: Vec<Line> = fit_lines(wrap_words(&text, area.width as usize), area)
+        .into_iter()
+        .map(|line| Line::styled(line, Style::new().fg(Color::Gray)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The first lines of wrapped text that fit in `area`, with the last one
+/// ending in "…" if any were left out.
+fn fit_lines(mut lines: Vec<String>, area: Rect) -> Vec<String> {
+    let height = area.height as usize;
+    if lines.len() > height && height > 0 {
+        lines.truncate(height);
+        let last = lines.last_mut().unwrap();
+        *last = truncate(&format!("{last} …"), area.width as usize);
+        if !last.ends_with('…') {
+            last.push('…');
+        }
+    }
+    lines
 }
 
 /// Builds the rows, with section headings, and scrolls to keep the cursor in view.
 fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
     let rows = editor.rows();
-    let label_width = 18usize;
+    let room = area.width as usize;
+
+    // Labels get the width of the longest one, but never more than two fifths
+    // of the row, so the values always have space.
+    let longest = rows
+        .iter()
+        .filter(|row| matches!(row, Row::Alias | Row::Essential(_) | Row::Option(_)))
+        .map(|row| width(&editor.row_label(*row)))
+        .max()
+        .unwrap_or(4);
+    let label_width = longest.min((room * 2 / 5).max(4));
+    let value_room = room.saturating_sub(2 + label_width + 2).max(1);
+
     // Values are typed in place, so a long one (a ProxyCommand, say) has to
     // scroll sideways to keep the cursor on screen.
-    let value_width = (area.width as usize).saturating_sub(label_width + 3).max(8);
     let inline_scroll = editor.inline.as_ref().map_or(0, |input| {
-        input.col.saturating_sub(value_width.saturating_sub(1))
+        input.col.saturating_sub(value_room.saturating_sub(1))
     });
 
     // (row index this line belongs to, rendered line)
@@ -320,8 +529,8 @@ fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
         }
 
         let focused = index == editor.cursor;
-        let marker = if focused { "▸ " } else { "  " };
-        let name_style = if focused {
+        let marker = Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT));
+        let emphasis = if focused {
             Style::new().fg(ACCENT).bold()
         } else {
             Style::new()
@@ -329,11 +538,11 @@ fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
 
         let line = match row {
             Row::AddForward | Row::AddOption => Line::from(vec![
-                Span::styled(marker, Style::new().fg(ACCENT)),
+                marker,
                 Span::styled(
-                    editor.row_label(*row),
+                    truncate(&editor.row_label(*row), room.saturating_sub(2)),
                     if focused {
-                        Style::new().fg(ACCENT).bold()
+                        emphasis
                     } else {
                         Style::new().fg(MUTED)
                     },
@@ -341,64 +550,84 @@ fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
             ]),
             Row::Forward(i) => {
                 let forward = &editor.forwards[*i];
-                Line::from(vec![
-                    Span::styled(marker, Style::new().fg(ACCENT)),
+                // A filled dot for a live forward, hollow for a switched-off one.
+                let (dot, dot_style, text_style) = if forward.enabled {
+                    ("● ", Style::new().fg(Color::Green), emphasis)
+                } else {
+                    ("○ ", Style::new().fg(MUTED), Style::new().fg(MUTED))
+                };
+                let mut spans = vec![
+                    marker,
+                    Span::styled(dot, dot_style),
                     Span::styled(
-                        format!("{:<8}", forward.kind.label()),
-                        Style::new().fg(Color::Magenta),
+                        format!("{:<7}", forward.kind.label()),
+                        if forward.enabled {
+                            Style::new().fg(Color::Magenta)
+                        } else {
+                            Style::new().fg(MUTED)
+                        },
                     ),
-                    Span::styled(forward.describe(), name_style),
-                ])
+                ];
+                let tail = if forward.enabled { "" } else { "  off" };
+                let describe_room = room.saturating_sub(2 + 2 + 7 + tail.len());
+                spans.push(Span::styled(
+                    truncate(&forward.describe(), describe_room),
+                    text_style,
+                ));
+                spans.push(Span::styled(tail, Style::new().fg(Color::Yellow)));
+                Line::from(spans)
             }
             _ => {
                 let label = editor.row_label(*row);
                 let value = editor.row_value(*row);
                 let is_comment = label == "#";
                 let inline = editor.inline.as_ref().filter(|_| focused);
-                let (value_span, value_style) = if let Some(input) = inline {
+                let (shown, value_style) = if let Some(input) = inline {
                     let shown: String = input
                         .value()
                         .chars()
                         .skip(inline_scroll)
-                        .take(value_width)
+                        .take(value_room)
                         .collect();
                     (shown, Style::new().fg(Color::Black).bg(ACCENT))
                 } else if value.trim().is_empty() {
                     ("—".to_string(), Style::new().fg(MUTED))
                 } else if is_comment {
-                    (value.clone(), Style::new().fg(MUTED).italic())
+                    (
+                        truncate(&value, value_room),
+                        Style::new().fg(MUTED).italic(),
+                    )
                 } else {
-                    (value.clone(), Style::new())
+                    (truncate(&value, value_room), Style::new())
+                };
+                let label_style = if is_comment {
+                    Style::new().fg(MUTED)
+                } else if focused {
+                    emphasis
+                } else {
+                    Style::new().fg(Color::Blue)
                 };
                 Line::from(vec![
-                    Span::styled(marker, Style::new().fg(ACCENT)),
+                    marker,
                     Span::styled(
-                        format!("{label:<label_width$}"),
-                        if is_comment {
-                            Style::new().fg(MUTED)
-                        } else {
-                            name_style.patch(Style::new().fg(if focused {
-                                ACCENT
-                            } else {
-                                Color::Blue
-                            }))
-                        },
+                        pad(&truncate(&label, label_width), label_width + 2),
+                        label_style,
                     ),
-                    Span::styled(value_span, value_style),
+                    Span::styled(shown, value_style),
                 ])
             }
         };
         lines.push((Some(index), line));
     }
 
-    // Scroll so the focused row stays on screen.
+    // Scroll so the focused row stays on screen, with a line of context below.
     let focus_line = lines
         .iter()
         .position(|(i, _)| *i == Some(editor.cursor))
         .unwrap_or(0);
     let height = area.height as usize;
-    let offset = focus_line
-        .saturating_sub(height.saturating_sub(2))
+    let offset = (focus_line + 2)
+        .saturating_sub(height)
         .min(lines.len().saturating_sub(height));
 
     let visible: Vec<Line> = lines
@@ -411,8 +640,8 @@ fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
 
     // Park the terminal cursor inside the value being typed.
     if let Some(input) = editor.inline.as_ref() {
-        let y = area.y + (focus_line.saturating_sub(offset)) as u16;
-        let x = area.x + 2 + label_width as u16 + (input.col - inline_scroll) as u16;
+        let y = area.y + focus_line.saturating_sub(offset) as u16;
+        let x = area.x + (2 + label_width + 2 + input.col - inline_scroll) as u16;
         if y < area.y + area.height && x < area.x + area.width {
             frame.set_cursor_position((x, y));
         }
@@ -426,7 +655,7 @@ fn section(lines: &mut Vec<(Option<usize>, Line<'static>)>, title: &str) {
     lines.push((
         None,
         Line::styled(
-            format!("  {title}"),
+            title.to_string(),
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
     ));
@@ -438,30 +667,48 @@ fn draw_picker(frame: &mut Frame, editor: &Editor, area: Rect) {
         return;
     };
 
-    let popup = centered(74, area.height.saturating_sub(4), area);
+    let popup = dialog(area, dialog_width(area, 74), area.height);
     frame.render_widget(Clear, popup);
     let outer = bordered(" Add an option ".into(), true).padding(Padding::horizontal(1));
     let inner = outer.inner(popup);
     frame.render_widget(outer, popup);
 
-    let [search_area, list_area, desc_area] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(3),
-        Constraint::Length(3),
+    let description_height = match inner.height {
+        12.. => 2,
+        7.. => 1,
+        _ => 0,
+    };
+    let gap = u16::from(inner.height >= 8);
+    let [search_area, _, list_area, desc_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(gap),
+        Constraint::Min(1),
+        Constraint::Length(description_height),
     ])
     .areas(inner);
 
-    let query = picker.query.value();
+    let room = inner.width as usize;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("search ", Style::new().fg(MUTED)),
-            Span::styled(query.clone(), Style::new().fg(ACCENT).bold()),
+            Span::styled(
+                truncate_left(&picker.query.value(), room.saturating_sub(8)),
+                Style::new().fg(ACCENT).bold(),
+            ),
             Span::styled("▌", Style::new().fg(ACCENT)),
         ])),
         search_area,
     );
 
     let matches = picker.matches();
+    // The type column goes first when space runs out.
+    let show_kind = room >= 40;
+    let name_width = if show_kind {
+        28.min(room.saturating_sub(2 + 11))
+    } else {
+        room.saturating_sub(2)
+    };
+
     let height = list_area.height as usize;
     let offset = picker.index.saturating_sub(height.saturating_sub(1));
     let lines: Vec<Line> = matches
@@ -478,39 +725,37 @@ fn draw_picker(frame: &mut Frame, editor: &Editor, area: Rect) {
             } else {
                 Style::new().fg(Color::Gray)
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT)),
-                Span::styled(format!("{:<28}", keyword.name), style),
-                Span::styled(
+                Span::styled(pad(&truncate(keyword.name, name_width), name_width), style),
+            ];
+            if show_kind {
+                spans.push(Span::styled(
                     format!(" {}", kind_label(keyword.kind)),
                     Style::new().fg(if focused { ACCENT } else { MUTED }),
-                ),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), list_area);
-
-    let description = match picker.selected() {
-        Some(keyword) => {
-            let mut spans = vec![Span::styled(keyword.desc, Style::new().fg(Color::Gray))];
-            if let Some(default) = keyword.default {
-                spans.push(Span::styled(
-                    format!(" (default: {default})"),
-                    Style::new().fg(MUTED),
                 ));
             }
             Line::from(spans)
-        }
-        None => Line::styled("  no match", Style::new().fg(MUTED)),
+        })
+        .collect();
+    let lines = if lines.is_empty() {
+        vec![Line::styled("no match", Style::new().fg(MUTED))]
+    } else {
+        lines
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            description,
-            key_hints(&[("↵", "add"), ("↑↓", "move"), ("esc", "back")]),
-        ])
-        .wrap(Wrap { trim: true }),
-        desc_area,
-    );
+    frame.render_widget(Paragraph::new(lines), list_area);
+
+    if let Some(keyword) = picker.selected().filter(|_| description_height > 0) {
+        let text = match keyword.default {
+            Some(default) => format!("{} (default: {default})", keyword.desc),
+            None => keyword.desc.to_string(),
+        };
+        let lines: Vec<Line> = fit_lines(wrap_words(&text, room), desc_area)
+            .into_iter()
+            .map(|line| Line::styled(line, Style::new().fg(Color::Gray)))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), desc_area);
+    }
 }
 
 /// The yes/no and one-of-N value list.
@@ -519,22 +764,29 @@ fn draw_choice(frame: &mut Frame, editor: &Editor, area: Rect) {
         return;
     };
 
-    let height = choice.values.len() as u16 + 5;
-    let popup = centered(56, height, area);
-    frame.render_widget(Clear, popup);
-    let outer = bordered(format!(" {} ", choice.keyword), true).padding(Padding::horizontal(1));
-    let inner = outer.inner(popup);
-    frame.render_widget(outer, popup);
+    let popup_width = dialog_width(area, 56);
+    let room = (popup_width as usize).saturating_sub(4);
+    let mut description = wrap_words(choice.desc, room);
+    description.truncate(3);
 
-    let mut lines = vec![
-        Line::styled(choice.desc, Style::new().fg(Color::Gray)),
-        Line::raw(""),
-    ];
+    // Borders, description, a gap, then the values — minus the gap and then
+    // the description if that is more than fits.
+    let values = choice.values.len();
+    let mut lines: Vec<Line> = Vec::new();
+    let full = 2 + description.len() + 1 + values;
+    if full <= area.height as usize {
+        lines.extend(
+            description
+                .iter()
+                .map(|d| Line::styled(d.clone(), Style::new().fg(Color::Gray))),
+        );
+        lines.push(Line::raw(""));
+    }
     for (index, value) in choice.values.iter().enumerate() {
         let focused = index == choice.index;
         let is_default = choice.default == Some(*value);
         lines.push(Line::from(vec![
-            Span::styled(if focused { " ▸ " } else { "   " }, Style::new().fg(ACCENT)),
+            Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT)),
             Span::styled(
                 format!("{value:<12}"),
                 if focused {
@@ -549,8 +801,17 @@ fn draw_choice(frame: &mut Frame, editor: &Editor, area: Rect) {
             ),
         ]));
     }
-    lines.push(key_hints(&[("↵", "choose"), ("esc", "back")]));
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    let popup = dialog(area, popup_width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, popup);
+    let outer = bordered(format!(" {} ", choice.keyword), true).padding(Padding::horizontal(1));
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    // Keep the highlighted value in view when the list is cut short.
+    let focus_line = lines.len() - values + choice.index;
+    let offset = (focus_line + 1).saturating_sub(inner.height as usize);
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
 }
 
 /// The port-forward form.
@@ -559,18 +820,26 @@ fn draw_forward_form(frame: &mut Frame, editor: &Editor, area: Rect) {
         return;
     };
 
-    let popup = centered(64, 16, area);
-    frame.render_widget(Clear, popup);
-    let title = if form.index.is_some() {
-        " Edit port forward "
-    } else {
-        " New port forward "
-    };
-    let outer = bordered(title.into(), true).padding(Padding::horizontal(1));
-    let inner = outer.inner(popup);
-    frame.render_widget(outer, popup);
+    let popup_width = dialog_width(area, 64);
+    let room = (popup_width as usize).saturating_sub(4);
+    let label_width = 13;
+    let value_room = room.saturating_sub(4 + label_width).max(1);
 
-    let mut lines = Vec::new();
+    // Each line, whether it can be dropped when space is short, and for the
+    // field being typed into, where its value starts.
+    struct FormLine {
+        line: Line<'static>,
+        optional: bool,
+        cursor: Option<usize>,
+    }
+    let mut lines: Vec<FormLine> = Vec::new();
+    let mut push = |line: Line<'static>, optional: bool, cursor: Option<usize>| {
+        lines.push(FormLine {
+            line,
+            optional,
+            cursor,
+        })
+    };
 
     // Direction, as three selectable words rather than a keyword to remember.
     let mut direction = vec![Span::styled(
@@ -589,104 +858,136 @@ fn draw_forward_form(frame: &mut Frame, editor: &Editor, area: Rect) {
         ));
         direction.push(Span::raw(" "));
     }
-    lines.push(Line::from(direction));
-    lines.push(Line::styled(
-        format!("    {}", form.forward.kind.summary()),
-        Style::new().fg(Color::Gray),
-    ));
-    lines.push(Line::raw(""));
+    push(Line::from(direction), false, None);
+    for summary in wrap_words(form.forward.kind.summary(), room.saturating_sub(2)) {
+        push(
+            Line::styled(format!("  {summary}"), Style::new().fg(Color::Gray)),
+            true,
+            None,
+        );
+    }
 
-    let visible = form.visible_fields();
-    for field in 0..visible {
-        if field == 0 {
-            lines.push(Line::styled(
-                format!("  {}", form.forward.kind.listen_label()),
-                Style::new().fg(Color::Yellow),
-            ));
-        }
-        if field == 2 {
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                format!("  {}", form.forward.kind.dest_label()),
-                Style::new().fg(Color::Yellow),
-            ));
+    for field in 0..form.visible_fields() {
+        if field == 0 || field == 2 {
+            push(Line::raw(""), true, None);
+            let heading = if field == 0 {
+                form.forward.kind.listen_label()
+            } else {
+                form.forward.kind.dest_label()
+            };
+            push(
+                Line::styled(truncate(heading, room), Style::new().fg(Color::Yellow)),
+                false,
+                None,
+            );
         }
         let focused = form.field == field + 1;
-        let value = form.inputs[field].value();
-        lines.push(Line::from(vec![
-            Span::styled(
-                if focused { "  ▸ " } else { "    " },
-                Style::new().fg(ACCENT),
-            ),
-            Span::styled(
-                format!("{:<26}", ForwardForm::FIELDS[field]),
-                Style::new().fg(if focused { ACCENT } else { Color::Blue }),
-            ),
-            Span::styled(
-                if value.is_empty() {
-                    "—".to_string()
-                } else {
-                    value
-                },
-                if focused {
-                    Style::new().fg(Color::Black).bg(ACCENT)
-                } else {
-                    Style::new()
-                },
-            ),
-        ]));
+        let input = &form.inputs[field];
+        let value = input.value();
+        let scroll = if focused {
+            input.col.saturating_sub(value_room.saturating_sub(1))
+        } else {
+            0
+        };
+        let (shown, style) = if value.is_empty() && !focused {
+            // The bind address is the one field that is fine to leave empty.
+            let placeholder = if field == 0 { "optional" } else { "—" };
+            (placeholder.to_string(), Style::new().fg(MUTED))
+        } else if focused {
+            (
+                value.chars().skip(scroll).take(value_room).collect(),
+                Style::new().fg(Color::Black).bg(ACCENT),
+            )
+        } else {
+            (truncate(&value, value_room), Style::new())
+        };
+        push(
+            Line::from(vec![
+                Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT)),
+                Span::styled(
+                    pad(ForwardForm::FIELDS[field], label_width + 2),
+                    Style::new().fg(if focused { ACCENT } else { Color::Blue }),
+                ),
+                Span::styled(shown, style),
+            ]),
+            false,
+            focused.then_some(2 + label_width + 2 + input.col - scroll),
+        );
     }
 
     // A live preview of the line this will write, so there is no mystery about
     // what lands in the file.
-    let complete = form.forward.is_complete();
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("  writes  ", Style::new().fg(MUTED)),
-        Span::styled(
-            form.forward.line(),
-            if complete {
-                Style::new().fg(Color::Green)
-            } else {
-                Style::new().fg(MUTED).italic()
-            },
-        ),
-    ]));
-    if let Some(error) = &form.error {
-        lines.push(Line::styled(
-            format!("  {error}"),
-            Style::new().fg(Color::Red).bold(),
-        ));
+    push(Line::raw(""), true, None);
+    let preview_style = if form.forward.is_complete() {
+        Style::new().fg(Color::Green)
+    } else {
+        Style::new().fg(MUTED).italic()
+    };
+    // Blanks show as <port>/<host>, so the preview reads as a template
+    // rather than a broken line.
+    let mut preview = form.forward.clone();
+    for (value, placeholder) in [
+        (&mut preview.listen, "<port>"),
+        (&mut preview.host, "<host>"),
+        (&mut preview.port, "<port>"),
+    ] {
+        if value.trim().is_empty() {
+            *value = placeholder.to_string();
+        }
     }
-    lines.push(key_hints(&[
-        ("←→", "direction"),
-        ("↑↓", "field"),
-        ("↵", "done"),
-        ("esc", "back"),
-    ]));
+    push(
+        Line::from(vec![
+            Span::styled("writes ", Style::new().fg(MUTED)),
+            Span::styled(
+                truncate(&preview.file_line(), room.saturating_sub(7)),
+                preview_style,
+            ),
+        ]),
+        false,
+        None,
+    );
+    if let Some(error) = &form.error {
+        for part in wrap_words(error, room) {
+            push(
+                Line::styled(part, Style::new().fg(Color::Red).bold()),
+                false,
+                None,
+            );
+        }
+    }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    // Too tall for the screen: drop the spacing and the summary first.
+    let available = area.height.saturating_sub(2) as usize;
+    if lines.len() > available {
+        lines.retain(|line| !line.optional);
+    }
 
-    if form.field > 0 {
-        let field = form.field - 1;
-        let row = lines_before_field(field);
-        let x = inner.x + 4 + 26 + form.inputs[field].col as u16;
-        let y = inner.y + row;
+    let title = if form.index.is_some() {
+        " Edit port forward "
+    } else {
+        " New port forward "
+    };
+    let popup = dialog(area, popup_width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, popup);
+    let outer = bordered(title.into(), true).padding(Padding::horizontal(1));
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    // Still too tall: scroll to keep the field being edited in view.
+    let focus_line = lines
+        .iter()
+        .position(|line| line.cursor.is_some())
+        .unwrap_or(0);
+    let offset = (focus_line + 1).saturating_sub(inner.height as usize);
+    if let Some(column) = lines.get(focus_line).and_then(|line| line.cursor) {
+        let x = inner.x + column as u16;
+        let y = inner.y + (focus_line - offset) as u16;
         if x < inner.x + inner.width && y < inner.y + inner.height {
             frame.set_cursor_position((x, y));
         }
     }
-}
-
-/// Where a forward-form field lands vertically, given the headings above it.
-fn lines_before_field(field: usize) -> u16 {
-    // direction + summary + blank + "listen on" heading
-    let mut row = 4u16;
-    row += field as u16;
-    if field >= 2 {
-        row += 2; // blank + destination heading
-    }
-    row
+    let lines: Vec<Line> = lines.into_iter().map(|line| line.line).collect();
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
 }
 
 fn kind_label(kind: Kind) -> &'static str {
@@ -702,43 +1003,83 @@ fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
-fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
+/// As many key hints as fit in `room`, in order, with `pinned` always last.
+fn fit_hints(keys: &[(&str, &str)], pinned: Option<(&str, &str)>, room: usize) -> Line<'static> {
+    let cost = |(key, label): &(&str, &str)| width(key) + 1 + width(label) + 2;
+    let mut budget = room.saturating_sub(1 + pinned.as_ref().map_or(0, cost));
+
     let mut spans = vec![Span::raw(" ")];
-    for (key, label) in keys {
+    let add = |spans: &mut Vec<Span<'static>>, (key, label): (&str, &str)| {
         spans.push(Span::styled(
-            (*key).to_string(),
+            key.to_string(),
             Style::new().fg(ACCENT).bold(),
         ));
         spans.push(Span::styled(format!(" {label}  "), Style::new().fg(MUTED)));
+    };
+    for hint in keys {
+        if cost(hint) > budget {
+            break;
+        }
+        budget -= cost(hint);
+        add(&mut spans, *hint);
+    }
+    if let Some(hint) = pinned {
+        add(&mut spans, hint);
     }
     Line::from(spans)
 }
 
+/// The app-level confirm dialog (delete, overwrite, reload, quit).
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(block) = app.selected() else { return };
-    let popup = centered(54, 7, area);
-    frame.render_widget(Clear, popup);
+    let Some(confirm) = app.confirm.as_ref() else {
+        return;
+    };
+    let choices: Vec<(char, &str)> = confirm
+        .choices
+        .iter()
+        .map(|(key, label, _)| (*key, *label))
+        .collect();
+    draw_confirm_box(frame, area, confirm.title, &confirm.message, &choices);
+}
 
-    let text = Text::from(vec![
-        Line::raw(""),
-        Line::from(vec![
-            Span::raw("  Delete "),
-            Span::styled(block.label(), Style::new().fg(ACCENT).bold()),
-            Span::raw("?"),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  y", Style::new().fg(Color::Red).bold()),
-            Span::styled(" delete   ", Style::new().fg(MUTED)),
-            Span::styled("any other key", Style::new().bold()),
-            Span::styled(" cancel", Style::new().fg(MUTED)),
-        ]),
-    ]);
-    let block = Border::bordered()
+/// A red-bordered question with its answers, sized to its text.
+fn draw_confirm_box(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    message: &str,
+    choices: &[(char, &str)],
+) {
+    let popup_width = dialog_width(area, 60);
+    let room = (popup_width as usize).saturating_sub(4);
+
+    let mut lines: Vec<Line> = wrap_words(message, room)
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+    lines.push(Line::raw(""));
+    for (key, label) in choices {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{key}  "), Style::new().fg(Color::Red).bold()),
+            Span::raw(truncate(label, room.saturating_sub(3))),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("any other key  ", Style::new().fg(MUTED)),
+        Span::styled("cancel", Style::new().fg(MUTED)),
+    ]));
+
+    let popup = dialog(area, popup_width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, popup);
+    let border = Border::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Red))
-        .title(" Confirm ");
-    frame.render_widget(Paragraph::new(text).block(block), popup);
+        .title(Span::styled(
+            title.to_string(),
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1));
+    frame.render_widget(Paragraph::new(lines).block(border), popup);
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
@@ -754,41 +1095,53 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("r", "reload the file from disk"),
         ("q / esc", "quit"),
         ("", ""),
-        ("in the host editor:", ""),
+        ("in the editor", ""),
         ("↑ / ↓", "move between rows"),
         ("enter", "edit the row, or open its dialog"),
+        ("space", "switch a forward on/off, flip a yes/no"),
         ("a", "add a port forward"),
-        ("space", "flip a yes/no option"),
-        ("d", "remove the row"),
-        ("ctrl-s", "save to ~/.ssh/config"),
-        ("esc", "cancel, or close a dialog"),
+        ("d", "remove the row (asks first)"),
+        ("esc", "done, or close a dialog"),
         ("", ""),
-        ("add a port forward", "for a local, remote or SOCKS tunnel"),
-        ("add an option", "search all 99 ssh_config options"),
+        ("", "Every change is saved as you make it."),
+        ("", "The file as it was before this session is kept"),
+        ("", "as config.bak."),
     ];
 
-    let popup = centered(62, rows.len() as u16 + 4, area);
+    let popup = dialog(area, dialog_width(area, 64), rows.len() as u16 + 2);
     frame.render_widget(Clear, popup);
+    let border = bordered(" Keys ".into(), true).padding(Padding::horizontal(1));
+    let inner = border.inner(popup);
+    frame.render_widget(border, popup);
 
-    let mut lines = vec![Line::raw("")];
-    lines.extend(rows.iter().map(|(key, description)| {
-        Line::from(vec![
-            Span::styled(format!("  {key:>16}  "), Style::new().fg(ACCENT).bold()),
-            Span::styled(*description, Style::new().fg(Color::Gray)),
-        ])
-    }));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  Changes are written immediately; the previous file is kept as config.bak.",
-        Style::new().fg(MUTED),
-    ));
+    let room = inner.width as usize;
+    let key_width = if room >= 50 { 16 } else { 11 };
+    let mut lines: Vec<Line> = rows
+        .iter()
+        .map(|(key, description)| {
+            if key.is_empty() {
+                return Line::styled(truncate(description, room), Style::new().fg(MUTED));
+            }
+            Line::from(vec![
+                Span::styled(pad(key, key_width + 2), Style::new().fg(ACCENT).bold()),
+                Span::styled(
+                    truncate(description, room.saturating_sub(key_width + 2)),
+                    Style::new().fg(Color::Gray),
+                ),
+            ])
+        })
+        .collect();
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(bordered(" Keys ".into(), true))
-            .wrap(Wrap { trim: false }),
-        popup,
-    );
+    // Say so when the list doesn't fit, rather than silently cutting it.
+    let height = inner.height as usize;
+    if lines.len() > height && height > 0 {
+        lines.truncate(height - 1);
+        lines.push(Line::styled(
+            truncate("… a taller window shows the rest", room),
+            Style::new().fg(MUTED).italic(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn bordered(title: String, focused: bool) -> Border<'static> {
@@ -806,16 +1159,93 @@ fn bordered(title: String, focused: bool) -> Border<'static> {
         ))
 }
 
-/// A popup of at most `width` x `height`, centred, clamped to the screen.
-fn centered(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width.saturating_sub(2)).max(1);
-    let height = height.min(area.height.saturating_sub(2)).max(1);
+/// The width a dialog asking for `wanted` columns gets: all of it when there's
+/// a margin to spare, or the screen less that margin while that still leaves a
+/// usable dialog, or else the whole screen.
+fn dialog_width(area: Rect, wanted: u16) -> u16 {
+    let with_margin = area.width.saturating_sub(4);
+    if wanted <= with_margin {
+        wanted
+    } else if with_margin >= 40 {
+        with_margin
+    } else {
+        area.width
+    }
+}
+
+/// Where a dialog `width` (from [`dialog_width`]) by `height` goes: floating
+/// in the middle when it fits with a margin, otherwise the whole of `area`. A
+/// popup that meets the screen edge on some sides but not others cuts through
+/// the borders underneath and only looks broken.
+fn dialog(area: Rect, width: u16, height: u16) -> Rect {
+    if width >= area.width || height + 2 > area.height {
+        return area;
+    }
     Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
         width,
         height,
     }
+}
+
+/// Display width in columns. Everything we draw is single-width.
+fn width(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// `text` cut to `room` columns, ending in "…" if anything was lost.
+fn truncate(text: &str, room: usize) -> String {
+    if width(text) <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let mut cut: String = text.chars().take(room - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// Like [`truncate`], but keeps the end: `…/.ssh/config`.
+fn truncate_left(text: &str, room: usize) -> String {
+    let len = width(text);
+    if len <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let tail: String = text.chars().skip(len - (room - 1)).collect();
+    format!("…{tail}")
+}
+
+/// `text` padded with spaces to `room` columns.
+fn pad(text: &str, room: usize) -> String {
+    format!("{text:<room$}")
+}
+
+/// Greedy word wrap to `room` columns; words longer than a line are cut.
+fn wrap_words(text: &str, room: usize) -> Vec<String> {
+    if room == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let word = truncate(word, room);
+        if !line.is_empty() && width(&line) + 1 + width(&word) > room {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -850,7 +1280,11 @@ Match host bastion
 ";
 
     fn render(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(96, 26)).unwrap();
+        render_at(app, 96, 26)
+    }
+
+    fn render_at(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -975,6 +1409,55 @@ Match host bastion
             "scrolled to the end:\n{screen}"
         );
         assert!(screen.contains("+ add an option"));
+    }
+
+    #[test]
+    #[ignore = "prints small-terminal screens: cargo test small_screens -- --ignored --nocapture"]
+    fn small_screens() {
+        for (w, h) in [(96, 26), (60, 24), (60, 16), (44, 14), (30, 8)] {
+            let mut app = sample_app();
+            press(&mut app, 'j');
+            println!("\n=== LIST {w}x{h} ===\n{}", render_at(&mut app, w, h));
+            press(&mut app, 'e');
+            println!("\n=== EDITOR {w}x{h} ===\n{}", render_at(&mut app, w, h));
+            focus(&mut app, "+ add a port forward");
+            app.on_key(key(KeyCode::Enter));
+            println!("\n=== FORWARD {w}x{h} ===\n{}", render_at(&mut app, w, h));
+        }
+
+        // Switched-off forward, and the dialogs, at a mid and a small size.
+        for (w, h) in [(60, 24), (44, 14)] {
+            let mut app = sample_app();
+            press(&mut app, 'j');
+            press(&mut app, 'e');
+            let editor = app.editor.as_mut().unwrap();
+            editor.forwards[0].enabled = false;
+            editor.cursor = editor
+                .rows()
+                .iter()
+                .position(|r| *r == Row::Forward(0))
+                .unwrap();
+            println!(
+                "\n=== FORWARD OFF {w}x{h} ===\n{}",
+                render_at(&mut app, w, h)
+            );
+            press(&mut app, 'd');
+            println!(
+                "\n=== REMOVE ROW {w}x{h} ===\n{}",
+                render_at(&mut app, w, h)
+            );
+
+            let mut app = sample_app();
+            press(&mut app, 'j');
+            press(&mut app, 'd');
+            println!(
+                "\n=== DELETE HOST {w}x{h} ===\n{}",
+                render_at(&mut app, w, h)
+            );
+            let mut app = sample_app();
+            press(&mut app, '?');
+            println!("\n=== HELP {w}x{h} ===\n{}", render_at(&mut app, w, h));
+        }
     }
 
     #[test]

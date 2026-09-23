@@ -2,13 +2,19 @@
 //! text boxes. Forwards get a purpose-built form, every other ssh_config
 //! keyword comes from the generated catalogue with a value editor that matches
 //! its type, and anything we do not recognise stays editable as raw text.
+//!
+//! There is no save step: every change reports [`EditorEvent::Changed`] and the
+//! app writes it out straight away. That makes two things matter more than
+//! they would otherwise — values are validated before they are accepted, and
+//! removing anything asks first.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use crate::config::{Block, split_directive};
 use crate::forward::{Forward, ForwardKind, is_port};
 use crate::schema::{self, Keyword, Kind};
 use crate::textinput::TextInput;
+use crate::validate;
 
 /// Directives pinned to the top of the form, always visible even when unset.
 pub const ESSENTIALS: [&str; 4] = ["HostName", "User", "Port", "IdentityFile"];
@@ -38,10 +44,23 @@ pub enum Overlay {
     Choice(Choice),
     /// The port-forward form.
     Forward(ForwardForm),
+    /// "Remove this row?" — removing saves immediately, so it asks first.
+    ConfirmRemove(Row),
+}
+
+/// What a key press did, as far as the app is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorEvent {
+    /// Nothing that needs writing.
+    None,
+    /// The host changed and should be saved.
+    Changed,
+    /// The user is done with the editor.
+    Close,
 }
 
 pub struct Editor {
-    /// Index into `config.blocks`, or `None` when adding a host.
+    /// Index into `config.blocks`, or `None` for a host not yet written.
     pub target: Option<usize>,
     pub alias: String,
     pub essentials: [String; ESSENTIALS.len()],
@@ -50,7 +69,11 @@ pub struct Editor {
     pub cursor: usize,
     /// Set while typing into the focused row.
     pub inline: Option<TextInput>,
+    /// Whether the row being typed into was just added from the picker, so
+    /// abandoning it removes the placeholder rather than an existing option.
+    inline_is_new: bool,
     pub overlay: Option<Overlay>,
+    /// A problem with the last key press, for the status bar.
     pub error: Option<String>,
 }
 
@@ -64,13 +87,17 @@ impl Editor {
             options: Vec::new(),
             cursor: 0,
             inline: None,
+            inline_is_new: false,
             overlay: None,
             error: None,
         };
 
         for line in &block.body {
             let Some((key, value)) = split_directive(line) else {
-                if !line.trim().is_empty() {
+                // A commented-out forward is a switched-off one.
+                if let Some(forward) = Forward::parse_disabled(line) {
+                    editor.forwards.push(forward);
+                } else if !line.trim().is_empty() {
                     editor
                         .options
                         .push(OptionRow::Comment(line.trim().to_string()));
@@ -93,6 +120,13 @@ impl Editor {
                 }),
             }
         }
+        editor
+    }
+
+    /// An editor for a brand-new host, already typing its alias.
+    pub fn new_host() -> Self {
+        let mut editor = Editor::new(None, &Block::new_host(""));
+        editor.activate();
         editor
     }
 
@@ -143,6 +177,30 @@ impl Editor {
         }
     }
 
+    /// How a row reads in the "Remove …?" dialog.
+    pub fn describe_row(&self, row: Row) -> String {
+        match row {
+            Row::Forward(i) => {
+                let forward = &self.forwards[i];
+                let off = if forward.enabled {
+                    ""
+                } else {
+                    " (switched off)"
+                };
+                format!(
+                    "the {} forward {}{off}",
+                    forward.kind.label(),
+                    forward.describe()
+                )
+            }
+            Row::Option(i) => match &self.options[i] {
+                OptionRow::Directive { key, value } => format!("{key} {value}"),
+                OptionRow::Comment(text) => format!("the comment '{text}'"),
+            },
+            _ => format!("{} {}", self.row_label(row), self.row_value(row)),
+        }
+    }
+
     /// The catalogue entry for a row, when it maps to a known keyword.
     fn keyword_of(&self, row: Row) -> Option<&'static Keyword> {
         match row {
@@ -170,32 +228,26 @@ impl Editor {
         }
     }
 
-    /// Handles a key. Returns `Some(true)` to save, `Some(false)` to cancel.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<bool> {
+    pub fn handle_key(&mut self, key: KeyEvent) -> EditorEvent {
         self.error = None;
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            return Some(true);
-        }
         if self.overlay.is_some() {
-            self.handle_overlay(key);
-            return None;
+            return self.handle_overlay(key);
         }
         if self.inline.is_some() {
-            self.handle_inline(key);
-            return None;
+            return self.handle_inline(key);
         }
 
         match key.code {
-            KeyCode::Esc => return Some(false),
+            KeyCode::Esc => return EditorEvent::Close,
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Enter => self.activate(),
-            KeyCode::Char(' ') => self.toggle_or_activate(),
-            KeyCode::Char('d') | KeyCode::Delete => self.delete_row(),
+            KeyCode::Char(' ') => return self.toggle_or_activate(),
+            KeyCode::Char('d') | KeyCode::Delete => self.ask_to_remove(),
             KeyCode::Char('a') => self.add_forward(),
             _ => {}
         }
-        None
+        EditorEvent::None
     }
 
     /// Opens the forward form for a new tunnel, from wherever the cursor is.
@@ -225,16 +277,25 @@ impl Editor {
                 // never have to remember whether it is "ask" or "confirm".
                 Some(Kind::Flag) | Some(Kind::Choice) => {
                     let keyword = self.keyword_of(row).unwrap();
-                    self.overlay = Some(Overlay::Choice(Choice::new(keyword, row)));
+                    let current = self.row_value(row);
+                    self.overlay = Some(Overlay::Choice(Choice::new(keyword, Some(row), &current)));
                 }
-                _ => self.inline = Some(TextInput::single(&self.row_value(row))),
+                _ => {
+                    self.inline = Some(TextInput::single(&self.row_value(row)));
+                    self.inline_is_new = false;
+                }
             },
         }
     }
 
-    /// Space flips a yes/no straight away rather than opening a list.
-    fn toggle_or_activate(&mut self) {
+    /// Space switches a forward on or off, and flips a yes/no straight away
+    /// rather than opening a list.
+    fn toggle_or_activate(&mut self) -> EditorEvent {
         let row = self.current_row();
+        if let Row::Forward(i) = row {
+            self.forwards[i].enabled = !self.forwards[i].enabled;
+            return EditorEvent::Changed;
+        }
         // Some yes/no options are spelled as two-value enums in ssh's parser;
         // both should toggle.
         if self
@@ -247,9 +308,10 @@ impl Editor {
                 "yes"
             };
             self.set_row_value(row, next.to_string());
-            return;
+            return EditorEvent::Changed;
         }
         self.activate();
+        EditorEvent::None
     }
 
     fn set_row_value(&mut self, row: Row, value: String) {
@@ -264,8 +326,21 @@ impl Editor {
         }
     }
 
-    fn delete_row(&mut self) {
-        match self.current_row() {
+    /// Opens the confirm dialog, if the focused row has anything to remove.
+    fn ask_to_remove(&mut self) {
+        let row = self.current_row();
+        let removable = match row {
+            Row::Essential(i) => !self.essentials[i].trim().is_empty(),
+            Row::Forward(_) | Row::Option(_) => true,
+            Row::Alias | Row::AddForward | Row::AddOption => false,
+        };
+        if removable {
+            self.overlay = Some(Overlay::ConfirmRemove(row));
+        }
+    }
+
+    fn remove_row(&mut self, row: Row) {
+        match row {
             Row::Essential(i) => self.essentials[i].clear(),
             Row::Forward(i) => {
                 self.forwards.remove(i);
@@ -283,47 +358,73 @@ impl Editor {
         }
     }
 
-    fn handle_inline(&mut self, key: KeyEvent) {
+    /// Checks a typed value for the focused row before it is accepted.
+    fn check(&self, row: Row, value: &str) -> Result<(), String> {
+        if row == Row::Alias && value.is_empty() {
+            return Err("A host needs an alias — the name you type after ssh".into());
+        }
+        match self.keyword_of(row) {
+            Some(keyword) => validate::check(keyword, value),
+            None => Ok(()),
+        }
+    }
+
+    fn handle_inline(&mut self, key: KeyEvent) -> EditorEvent {
+        let row = self.current_row();
         let Some(input) = self.inline.as_mut() else {
-            return;
+            return EditorEvent::None;
         };
         match key.code {
             KeyCode::Enter => {
-                let value = input.value().trim().to_string();
+                let mut value = input.value().trim().to_string();
+                // A bad value stays in the box, so it can be fixed rather
+                // than retyped.
+                if let Err(message) = self.check(row, &value) {
+                    self.error = Some(message);
+                    return EditorEvent::None;
+                }
                 self.inline = None;
-                let row = self.current_row();
-                // An option left empty was never really added.
-                if let (true, Row::Option(i)) = (value.is_empty(), row)
-                    && matches!(&self.options[i], OptionRow::Directive { .. })
-                {
-                    self.options.remove(i);
-                    self.cursor = self.cursor.saturating_sub(1);
-                    return;
+
+                if let Row::Option(i) = row {
+                    // Clearing an option's value removes the option.
+                    if value.is_empty() && matches!(self.options[i], OptionRow::Directive { .. }) {
+                        let was_new = std::mem::take(&mut self.inline_is_new);
+                        self.remove_row(row);
+                        return if was_new {
+                            EditorEvent::None
+                        } else {
+                            EditorEvent::Changed
+                        };
+                    }
+                    // Without its '#', an edited comment would become a
+                    // directive ssh can't parse.
+                    if matches!(self.options[i], OptionRow::Comment(_)) && !value.starts_with('#') {
+                        value = format!("# {value}");
+                    }
+                }
+                self.inline_is_new = false;
+                if value == self.row_value(row) {
+                    return EditorEvent::None;
                 }
                 self.set_row_value(row, value);
+                EditorEvent::Changed
             }
             KeyCode::Esc => {
                 self.inline = None;
-                // Cancelling a brand-new option removes the placeholder row.
-                let row = self.current_row();
-                let placeholder = OptionRow::Directive {
-                    key: self.row_label(row),
-                    value: String::new(),
-                };
-                if let Row::Option(i) = row
-                    && self.options[i] == placeholder
-                {
-                    self.options.remove(i);
-                    self.cursor = self.cursor.saturating_sub(1);
+                // Abandoning a just-picked option removes its placeholder row.
+                if std::mem::take(&mut self.inline_is_new) {
+                    self.remove_row(row);
                 }
+                EditorEvent::None
             }
             _ => {
                 input.handle_key(key);
+                EditorEvent::None
             }
         }
     }
 
-    fn handle_overlay(&mut self, key: KeyEvent) {
+    fn handle_overlay(&mut self, key: KeyEvent) -> EditorEvent {
         match self.overlay.as_mut() {
             Some(Overlay::Picker(picker)) => match picker.handle_key(key) {
                 PickerResult::Cancel => self.overlay = None,
@@ -339,13 +440,15 @@ impl Editor {
                 KeyCode::Up | KeyCode::Char('k') => choice.move_by(-1),
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     let Some(Overlay::Choice(choice)) = self.overlay.take() else {
-                        return;
+                        return EditorEvent::None;
                     };
                     let value = choice.values[choice.index].to_string();
                     match choice.row {
+                        Some(row) if self.row_value(row) == value => return EditorEvent::None,
                         Some(row) => self.set_row_value(row, value),
                         None => self.push_option(choice.keyword, value),
                     }
+                    return EditorEvent::Changed;
                 }
                 _ => {}
             },
@@ -353,20 +456,33 @@ impl Editor {
                 ForwardResult::Cancel => self.overlay = None,
                 ForwardResult::Save => {
                     let Some(Overlay::Forward(form)) = self.overlay.take() else {
-                        return;
+                        return EditorEvent::None;
                     };
                     match form.index {
+                        Some(index) if self.forwards[index] == form.forward => {
+                            return EditorEvent::None;
+                        }
                         Some(index) => self.forwards[index] = form.forward,
                         None => {
                             self.forwards.push(form.forward);
                             self.focus(Row::Forward(self.forwards.len() - 1));
                         }
                     }
+                    return EditorEvent::Changed;
                 }
                 ForwardResult::Continue => {}
             },
+            Some(Overlay::ConfirmRemove(row)) => {
+                let row = *row;
+                self.overlay = None;
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    self.remove_row(row);
+                    return EditorEvent::Changed;
+                }
+            }
             None => {}
         }
+        EditorEvent::None
     }
 
     /// Adds a keyword picked from the catalogue, routing it to whichever
@@ -395,11 +511,12 @@ impl Editor {
         }
         match keyword.kind {
             Kind::Flag | Kind::Choice => {
-                self.overlay = Some(Overlay::Choice(Choice::for_new(keyword)));
+                self.overlay = Some(Overlay::Choice(Choice::new(keyword, None, "")));
             }
             _ => {
                 self.push_option(keyword.name, String::new());
                 self.inline = Some(TextInput::single(""));
+                self.inline_is_new = true;
             }
         }
     }
@@ -412,18 +529,19 @@ impl Editor {
         self.focus(Row::Option(self.options.len() - 1));
     }
 
-    /// Validates and renders the editor back into a config block.
+    /// Renders the editor back into a config block, checking the things that
+    /// would make the file unusable.
     /// The body is written essentials first, then forwards, then everything
     /// else in the order it was already in.
     pub fn to_block(&self, existing: Option<&Block>) -> Result<Block, String> {
         let alias = self.alias.trim();
         if alias.is_empty() {
-            return Err("Host alias can't be empty".into());
+            return Err("A host needs an alias — the name you type after ssh".into());
         }
         let port = self.essentials[2].trim();
         if !port.is_empty() && !is_port(port) {
             return Err(format!(
-                "Port must be a number between 1 and 65535, not '{port}'"
+                "Port must be a number from 1 to 65535, not '{port}'"
             ));
         }
         if let Some(bad) = self.forwards.iter().find(|f| !f.is_complete()) {
@@ -443,7 +561,7 @@ impl Editor {
                 lines.push(format!("{key} {value}"));
             }
         }
-        lines.extend(self.forwards.iter().map(Forward::line));
+        lines.extend(self.forwards.iter().map(Forward::file_line));
         for option in &self.options {
             match option {
                 OptionRow::Directive { key, value } if !value.trim().is_empty() => {
@@ -541,21 +659,20 @@ pub struct Choice {
 }
 
 impl Choice {
-    fn new(keyword: &'static Keyword, row: Row) -> Self {
+    /// Opens on `current` when it is one of the values, else on the first.
+    fn new(keyword: &'static Keyword, row: Option<Row>, current: &str) -> Self {
+        let index = keyword
+            .values
+            .iter()
+            .position(|v| v.eq_ignore_ascii_case(current.trim()))
+            .unwrap_or(0);
         Choice {
             keyword: keyword.name,
             desc: keyword.desc,
             default: keyword.default,
             values: keyword.values,
-            index: 0,
-            row: Some(row),
-        }
-    }
-
-    fn for_new(keyword: &'static Keyword) -> Self {
-        Choice {
-            row: None,
-            ..Choice::new(keyword, Row::Alias)
+            index,
+            row,
         }
     }
 
@@ -584,7 +701,9 @@ pub enum ForwardResult {
 }
 
 impl ForwardForm {
-    pub const FIELDS: [&'static str; 4] = ["Bind address (optional)", "Port", "Host", "Port"];
+    /// Field labels, after the direction selector. Headings above them say
+    /// which side each pair is on.
+    pub const FIELDS: [&'static str; 4] = ["Bind address", "Port", "Host", "Port"];
 
     fn new(index: Option<usize>, forward: Forward) -> Self {
         let inputs = [
@@ -663,7 +782,7 @@ impl ForwardForm {
 mod tests {
     use super::*;
     use crate::config::SshConfig;
-    use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
+    use ratatui::crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use std::path::PathBuf;
 
     const NAS: &str = "\
@@ -831,11 +950,12 @@ Host nas
         };
         assert_eq!(choice.values, ["yes", "no", "ask", "off", "accept-new"]);
         assert_eq!(choice.default, Some("ask"));
-
-        press(
-            &mut editor,
-            &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down],
+        assert_eq!(
+            choice.values[choice.index], "ask",
+            "opens on the current value"
         );
+
+        press(&mut editor, &[KeyCode::Down, KeyCode::Down]);
         press(&mut editor, &[KeyCode::Enter]);
         assert!(editor.overlay.is_none());
         assert_eq!(editor.row_value(editor.current_row()), "accept-new");
@@ -1087,18 +1207,43 @@ Host nas
     }
 
     #[test]
-    fn removing_rows() {
+    fn removing_a_row_asks_first() {
         let mut editor = open(NAS);
-        focus_row(&mut editor, |_, row| row == Row::Essential(1));
-        press(&mut editor, &[KeyCode::Char('d')]);
-        assert_eq!(editor.essentials[1], "");
-
         focus_row(&mut editor, |_, row| row == Row::Forward(1));
-        press(&mut editor, &[KeyCode::Char('d')]);
-        assert_eq!(editor.forwards.len(), 1);
 
-        focus_row(&mut editor, |e, row| e.row_label(row) == "#");
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('d'))),
+            EditorEvent::None
+        );
+        assert!(matches!(
+            editor.overlay,
+            Some(Overlay::ConfirmRemove(Row::Forward(1)))
+        ));
+        // Anything but y keeps it.
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('n'))),
+            EditorEvent::None
+        );
+        assert_eq!(editor.forwards.len(), 2);
+
         press(&mut editor, &[KeyCode::Char('d')]);
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('y'))),
+            EditorEvent::Changed
+        );
+        assert_eq!(editor.forwards.len(), 1);
+    }
+
+    #[test]
+    fn removing_each_kind_of_row() {
+        let mut editor = open(NAS);
+        let remove = |editor: &mut Editor, pick: &dyn Fn(&Editor, Row) -> bool| {
+            focus_row(editor, pick);
+            press(editor, &[KeyCode::Char('d'), KeyCode::Char('y')]);
+        };
+        remove(&mut editor, &|_, row| row == Row::Essential(1));
+        assert_eq!(editor.essentials[1], "");
+        remove(&mut editor, &|e, row| e.row_label(row) == "#");
         assert!(
             !editor
                 .options
@@ -1108,12 +1253,29 @@ Host nas
     }
 
     #[test]
+    fn nothing_to_remove_means_no_question() {
+        let mut editor = open("Host a\n");
+        for row in [
+            Row::Alias,
+            Row::Essential(0),
+            Row::AddForward,
+            Row::AddOption,
+        ] {
+            focus_row(&mut editor, |_, r| r == row);
+            press(&mut editor, &[KeyCode::Char('d')]);
+            assert!(editor.overlay.is_none(), "{row:?} has nothing to remove");
+        }
+    }
+
+    #[test]
     fn validation_rejects_bad_input_with_a_specific_message() {
         let mut editor = open("Host a\n");
         editor.alias = String::new();
-        assert_eq!(
-            editor.to_block(None).unwrap_err(),
-            "Host alias can't be empty"
+        assert!(
+            editor
+                .to_block(None)
+                .unwrap_err()
+                .contains("needs an alias")
         );
 
         let mut editor = open("Host a\n");
@@ -1131,7 +1293,17 @@ Host nas
     }
 
     #[test]
-    fn ctrl_s_saves_and_esc_cancels_from_anywhere() {
+    fn esc_closes_the_editor_but_closes_a_dialog_first() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |_, row| row == Row::AddOption);
+        press(&mut editor, &[KeyCode::Enter]);
+        assert_eq!(editor.handle_key(key(KeyCode::Esc)), EditorEvent::None);
+        assert!(editor.overlay.is_none());
+        assert_eq!(editor.handle_key(key(KeyCode::Esc)), EditorEvent::Close);
+    }
+
+    #[test]
+    fn ctrl_s_does_nothing() {
         let mut editor = open(NAS);
         let ctrl_s = KeyEvent {
             code: KeyCode::Char('s'),
@@ -1139,14 +1311,172 @@ Host nas
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         };
-        assert_eq!(editor.handle_key(ctrl_s), Some(true));
-        assert_eq!(editor.handle_key(key(KeyCode::Esc)), Some(false));
+        assert_eq!(editor.handle_key(ctrl_s), EditorEvent::None);
+    }
 
-        // ...but esc inside an overlay only closes the overlay.
+    #[test]
+    fn every_kind_of_change_asks_to_be_saved() {
+        // A typed value.
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |_, row| row == Row::Essential(1));
+        press(&mut editor, &[KeyCode::Enter]);
+        type_text(&mut editor, "x");
+        assert_eq!(editor.handle_key(key(KeyCode::Enter)), EditorEvent::Changed);
+
+        // A yes/no flipped with space.
+        focus_row(&mut editor, |e, row| e.row_label(row) == "Compression");
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char(' '))),
+            EditorEvent::Changed
+        );
+
+        // A forward switched off.
+        focus_row(&mut editor, |_, row| row == Row::Forward(0));
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char(' '))),
+            EditorEvent::Changed
+        );
+
+        // A value picked from a list.
+        let mut editor = open("Host a\n    StrictHostKeyChecking ask\n");
+        focus_row(&mut editor, |e, row| {
+            e.row_label(row) == "StrictHostKeyChecking"
+        });
+        press(&mut editor, &[KeyCode::Enter, KeyCode::Down]);
+        assert_eq!(editor.handle_key(key(KeyCode::Enter)), EditorEvent::Changed);
+    }
+
+    #[test]
+    fn leaving_a_value_as_it_was_is_not_a_change() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |_, row| row == Row::Essential(0));
+        press(&mut editor, &[KeyCode::Enter]);
+        assert_eq!(editor.handle_key(key(KeyCode::Enter)), EditorEvent::None);
+
+        // Re-choosing the value a list opened on.
+        let mut editor = open("Host a\n    StrictHostKeyChecking ask\n");
+        focus_row(&mut editor, |e, row| {
+            e.row_label(row) == "StrictHostKeyChecking"
+        });
+        press(&mut editor, &[KeyCode::Enter]);
+        assert_eq!(editor.handle_key(key(KeyCode::Enter)), EditorEvent::None);
+    }
+
+    #[test]
+    fn a_bad_value_is_kept_in_the_box_with_an_explanation() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |e, row| {
+            e.row_label(row) == "ServerAliveInterval"
+        });
+        press(&mut editor, &[KeyCode::Enter]);
+        type_text(&mut editor, "x");
+
+        assert_eq!(editor.handle_key(key(KeyCode::Enter)), EditorEvent::None);
+        assert!(editor.inline.is_some(), "still editing");
+        assert!(
+            editor
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("ServerAliveInterval")
+        );
+        assert_eq!(
+            editor.row_value(editor.current_row()),
+            "60",
+            "the saved value is untouched"
+        );
+    }
+
+    #[test]
+    fn an_edited_comment_stays_a_comment() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |e, row| e.row_label(row) == "#");
+        press(&mut editor, &[KeyCode::Enter]);
+        for _ in 0..40 {
+            press(&mut editor, &[KeyCode::Backspace]);
+        }
+        type_text(&mut editor, "Compression yes");
+        press(&mut editor, &[KeyCode::Enter]);
+        assert_eq!(
+            editor.row_value(editor.current_row()),
+            "# Compression yes",
+            "without its # it would become a directive"
+        );
+    }
+
+    #[test]
+    fn a_just_picked_option_left_empty_disappears_without_a_save() {
+        let mut editor = open("Host a\n");
         focus_row(&mut editor, |_, row| row == Row::AddOption);
         press(&mut editor, &[KeyCode::Enter]);
-        assert_eq!(editor.handle_key(key(KeyCode::Esc)), None);
-        assert!(editor.overlay.is_none());
+        type_text(&mut editor, "RemoteCommand");
+        press(&mut editor, &[KeyCode::Enter]);
+        assert_eq!(editor.options.len(), 1, "placeholder row while typing");
+
+        assert_eq!(editor.handle_key(key(KeyCode::Enter)), EditorEvent::None);
+        assert!(editor.options.is_empty());
+    }
+
+    #[test]
+    fn clearing_an_existing_option_removes_it() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |e, row| {
+            e.row_label(row) == "ServerAliveInterval"
+        });
+        press(
+            &mut editor,
+            &[KeyCode::Enter, KeyCode::Backspace, KeyCode::Backspace],
+        );
+        assert_eq!(editor.handle_key(key(KeyCode::Enter)), EditorEvent::Changed);
+        assert!(!editor.options.iter().any(
+            |o| matches!(o, OptionRow::Directive { key, .. } if key == "ServerAliveInterval")
+        ));
+    }
+
+    #[test]
+    fn a_switched_off_forward_is_read_back_and_written_as_a_comment() {
+        let text = "Host a\n    # LocalForward 8081 127.0.0.1:8081\n    # just a note\n";
+        let mut editor = open(text);
+        assert_eq!(editor.forwards.len(), 1);
+        assert!(!editor.forwards[0].enabled);
+        assert_eq!(
+            editor.options,
+            vec![OptionRow::Comment("# just a note".into())],
+            "prose comments stay comments"
+        );
+
+        // Switching it on writes the live directive.
+        focus_row(&mut editor, |_, row| row == Row::Forward(0));
+        press(&mut editor, &[KeyCode::Char(' ')]);
+        let block = editor.to_block(None).unwrap();
+        assert_eq!(block.body[0], "    LocalForward 8081 127.0.0.1:8081");
+
+        // And off again.
+        press(&mut editor, &[KeyCode::Char(' ')]);
+        let block = editor.to_block(None).unwrap();
+        assert_eq!(block.body[0], "    # LocalForward 8081 127.0.0.1:8081");
+    }
+
+    #[test]
+    fn editing_a_switched_off_forward_keeps_it_off() {
+        let mut editor = open("Host a\n    # LocalForward 8081 127.0.0.1:8081\n");
+        focus_row(&mut editor, |_, row| row == Row::Forward(0));
+        press(&mut editor, &[KeyCode::Enter, KeyCode::Down, KeyCode::Down]); // listen port
+        press(&mut editor, &[KeyCode::Backspace]);
+        type_text(&mut editor, "2");
+        press(&mut editor, &[KeyCode::Enter]);
+        assert_eq!(
+            editor.forwards[0].file_line(),
+            "# LocalForward 8082 127.0.0.1:8081"
+        );
+    }
+
+    #[test]
+    fn a_new_host_starts_by_typing_its_alias() {
+        let editor = Editor::new_host();
+        assert!(editor.is_new());
+        assert_eq!(editor.current_row(), Row::Alias);
+        assert!(editor.inline.is_some());
     }
 }
 

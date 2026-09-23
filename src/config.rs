@@ -156,6 +156,35 @@ pub struct SshConfig {
     /// Lines before the first stanza (global defaults, header comments).
     pub preamble: Vec<String>,
     pub blocks: Vec<Block>,
+    /// The file's contents as we last read or wrote them (`None`: no file).
+    /// Compared against the disk before every write, so edits made by another
+    /// program while we're open are never silently overwritten.
+    pub on_disk: Option<String>,
+    /// Whether this session has already taken its backup.
+    pub backed_up: bool,
+}
+
+/// Why a save didn't happen.
+#[derive(Debug)]
+pub enum SaveError {
+    /// The file changed on disk since we read it.
+    Conflict,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::Conflict => write!(f, "the file was changed by another program"),
+            SaveError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<io::Error> for SaveError {
+    fn from(e: io::Error) -> Self {
+        SaveError::Io(e)
+    }
 }
 
 impl SshConfig {
@@ -208,6 +237,8 @@ impl SshConfig {
             path,
             preamble,
             blocks,
+            on_disk: Some(text.to_string()),
+            backed_up: false,
         }
     }
 
@@ -219,6 +250,8 @@ impl SshConfig {
                 path,
                 preamble: Vec::new(),
                 blocks: Vec::new(),
+                on_disk: None,
+                backed_up: false,
             }),
             Err(e) => Err(e),
         }
@@ -233,22 +266,43 @@ impl SshConfig {
         parts.join("\n")
     }
 
-    /// Writes the config atomically, keeping a `.bak` of the previous contents.
+    /// Writes the config atomically.
+    ///
+    /// Refuses with [`SaveError::Conflict`] if the file changed on disk since
+    /// we last read or wrote it, unless `force` is set.
+    ///
+    /// The first write of a session copies the original file to `.bak`; later
+    /// writes leave it alone. Since every change saves straight away, a backup
+    /// per write would only ever hold the change before last — keeping the
+    /// file as it was when you opened it is the useful undo.
     ///
     /// The temp file lives in the same directory so the rename cannot cross a
-    /// filesystem boundary, and it is created with 0600 so the config is never
+    /// filesystem boundary, and it is created 0600 so the config is never
     /// briefly world-readable.
-    pub fn save(&self) -> io::Result<()> {
+    pub fn save(&mut self, force: bool) -> Result<(), SaveError> {
+        let current = match fs::read_to_string(&self.path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if !force && current != self.on_disk {
+            return Err(SaveError::Conflict);
+        }
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        if self.path.exists() {
+        if !self.backed_up && current.is_some() {
             fs::copy(&self.path, self.backup_path())?;
+            self.backed_up = true;
         }
 
+        let text = self.to_text();
         let tmp = self.path.with_extension("sshconfig-tmp");
-        write_private(&tmp, &self.to_text())?;
-        fs::rename(&tmp, &self.path)
+        write_private(&tmp, &text)?;
+        fs::rename(&tmp, &self.path)?;
+        self.on_disk = Some(text);
+        Ok(())
     }
 
     pub fn backup_path(&self) -> PathBuf {
@@ -270,6 +324,16 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()
+}
+
+/// `path` for display, with the home directory shown as `~`.
+pub fn display_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rest.display());
+    }
+    path.display().to_string()
 }
 
 /// The default config path, honouring `$HOME`.
@@ -432,7 +496,7 @@ Match host bastion exec \"test -n \\\"$WORK\\\"\"
 
         let mut config = SshConfig::load(path.clone()).unwrap();
         config.blocks.push(Block::new_host("new"));
-        config.save().unwrap();
+        config.save(false).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "Host old\n\nHost new\n");
         assert_eq!(
@@ -447,6 +511,63 @@ Match host bastion exec \"test -n \\\"$WORK\\\"\"
             assert_eq!(mode & 0o777, 0o600);
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch(name: &str, text: &str) -> (PathBuf, SshConfig) {
+        let dir = std::env::temp_dir().join(format!("sshconfig-cfg-{}-{name}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        fs::write(&path, text).unwrap();
+        let config = SshConfig::load(path.clone()).unwrap();
+        (path, config)
+    }
+
+    #[test]
+    fn refuses_to_overwrite_changes_made_by_another_program() {
+        let (path, mut config) = scratch("conflict", "Host a\n");
+        fs::write(&path, "Host a\n\nHost added-in-vim\n").unwrap();
+
+        config.blocks.push(Block::new_host("mine"));
+        assert!(matches!(config.save(false), Err(SaveError::Conflict)));
+        assert!(
+            fs::read_to_string(&path).unwrap().contains("added-in-vim"),
+            "their edit is untouched"
+        );
+
+        // Forcing is an explicit choice to overwrite.
+        config.save(true).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("Host mine"));
+        // ...after which our own writes are no longer seen as a conflict.
+        config.blocks.push(Block::new_host("again"));
+        config.save(false).unwrap();
+    }
+
+    #[test]
+    fn backs_up_the_original_once_per_session() {
+        let (path, mut config) = scratch("backup-once", "Host original\n");
+        for name in ["one", "two", "three"] {
+            config.blocks.push(Block::new_host(name));
+            config.save(false).unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(config.backup_path()).unwrap(),
+            "Host original\n",
+            "the backup is the file as it was before this session"
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("Host three"));
+    }
+
+    #[test]
+    fn a_missing_file_is_created_without_a_conflict() {
+        let dir =
+            std::env::temp_dir().join(format!("sshconfig-cfg-{}-missing", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config");
+        let mut config = SshConfig::load(path.clone()).unwrap();
+        config.blocks.push(Block::new_host("first"));
+        config.save(false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "Host first\n");
+        assert!(!config.backup_path().exists(), "nothing to back up");
     }
 }
 
