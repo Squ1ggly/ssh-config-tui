@@ -73,8 +73,20 @@ pub struct Editor {
     /// abandoning it removes the placeholder rather than an existing option.
     inline_is_new: bool,
     pub overlay: Option<Overlay>,
+    /// Set while typing a `/` search.
+    pub search: Option<RowSearch>,
+    /// The last search accepted with enter, for `n` and `N`.
+    last_search: Option<String>,
     /// A problem with the last key press, for the status bar.
     pub error: Option<String>,
+}
+
+/// A `/` search over the editor's rows. The cursor follows the first match
+/// as you type; esc puts it back where it started.
+pub struct RowSearch {
+    pub query: TextInput,
+    /// Where the cursor was when the search began.
+    origin: usize,
 }
 
 impl Editor {
@@ -89,6 +101,8 @@ impl Editor {
             inline: None,
             inline_is_new: false,
             overlay: None,
+            search: None,
+            last_search: None,
             error: None,
         };
 
@@ -236,9 +250,21 @@ impl Editor {
         if self.inline.is_some() {
             return self.handle_inline(key);
         }
+        if self.search.is_some() {
+            self.handle_search(key);
+            return EditorEvent::None;
+        }
 
         match key.code {
             KeyCode::Esc => return EditorEvent::Close,
+            KeyCode::Char('/') => {
+                self.search = Some(RowSearch {
+                    query: TextInput::single(""),
+                    origin: self.cursor,
+                });
+            }
+            KeyCode::Char('n') => self.repeat_search(true),
+            KeyCode::Char('N') => self.repeat_search(false),
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Enter => self.activate(),
@@ -248,6 +274,125 @@ impl Editor {
             _ => {}
         }
         EditorEvent::None
+    }
+
+    /// What a row can be found by: its name and value as they read in the
+    /// file, and for a forward also how it's described on screen, so both
+    /// `LocalForward` and `8081` find it. The "+ add" rows aren't config lines
+    /// and can't be found.
+    fn searchable_text(&self, row: Row) -> Option<String> {
+        let text = match row {
+            Row::AddForward | Row::AddOption => return None,
+            Row::Forward(i) => {
+                let forward = &self.forwards[i];
+                let state = if forward.enabled { "" } else { " off" };
+                format!(
+                    "{} {} {}{state}",
+                    forward.line(),
+                    forward.kind.label(),
+                    forward.describe()
+                )
+            }
+            Row::Option(i) if matches!(self.options[i], OptionRow::Comment(_)) => {
+                self.row_value(row)
+            }
+            _ => format!("{} {}", self.row_label(row), self.row_value(row)),
+        };
+        Some(text.to_lowercase())
+    }
+
+    /// Cursor positions of every row matching `query`, case-insensitively.
+    pub fn search_matches(&self, query: &str) -> Vec<usize> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        self.rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                self.searchable_text(**row)
+                    .is_some_and(|text| text.contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The first match at or after `from`, wrapping round; or before it when
+    /// going backwards.
+    fn next_match(&self, query: &str, from: usize, forwards: bool) -> Option<usize> {
+        let matches = self.search_matches(query);
+        if forwards {
+            matches
+                .iter()
+                .find(|&&i| i >= from)
+                .or(matches.first())
+                .copied()
+        } else {
+            matches
+                .iter()
+                .rev()
+                .find(|&&i| i <= from)
+                .or(matches.last())
+                .copied()
+        }
+    }
+
+    fn handle_search(&mut self, key: KeyEvent) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.cursor = search.origin;
+                self.search = None;
+            }
+            KeyCode::Enter => {
+                let query = search.query.value();
+                self.search = None;
+                if !query.trim().is_empty() {
+                    self.last_search = Some(query);
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                let query = search.query.value();
+                if let Some(next) = self.next_match(&query, self.cursor + 1, true) {
+                    self.cursor = next;
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                let query = search.query.value();
+                if let Some(previous) = self.next_match(&query, self.cursor.wrapping_sub(1), false)
+                {
+                    self.cursor = previous;
+                }
+            }
+            _ => {
+                if search.query.handle_key(key) {
+                    // Refining the query searches again from where it began,
+                    // so the cursor stays with the nearest match.
+                    let (query, origin) = (search.query.value(), search.origin);
+                    self.cursor = self.next_match(&query, origin, true).unwrap_or(origin);
+                }
+            }
+        }
+    }
+
+    /// `n` and `N`: jump to the next or previous match of the last search.
+    fn repeat_search(&mut self, forwards: bool) {
+        let Some(query) = self.last_search.clone() else {
+            self.error = Some("Nothing to repeat yet — press / to search".into());
+            return;
+        };
+        let from = if forwards {
+            self.cursor + 1
+        } else {
+            self.cursor.wrapping_sub(1)
+        };
+        match self.next_match(&query, from, forwards) {
+            Some(index) => self.cursor = index,
+            None => self.error = Some(format!("No row matches '{query}'")),
+        }
     }
 
     /// Opens the forward form for a new tunnel, from wherever the cursor is.
@@ -1468,6 +1613,160 @@ Host nas
         assert_eq!(
             editor.forwards[0].file_line(),
             "# LocalForward 8082 127.0.0.1:8081"
+        );
+    }
+
+    // --- searching the rows ----------------------------------------------
+
+    fn search(editor: &mut Editor, query: &str) {
+        press(editor, &[KeyCode::Char('/')]);
+        type_text(editor, query);
+    }
+
+    fn current_label(editor: &Editor) -> String {
+        editor.row_label(editor.current_row())
+    }
+
+    #[test]
+    fn typing_a_search_jumps_to_the_first_match() {
+        let mut editor = open(NAS);
+        search(&mut editor, "alive");
+        assert!(editor.search.is_some(), "still searching");
+        assert_eq!(current_label(&editor), "ServerAliveInterval");
+    }
+
+    #[test]
+    fn searches_values_as_well_as_names() {
+        let mut editor = open(NAS);
+        search(&mut editor, "10.0.0.4");
+        assert_eq!(current_label(&editor), "HostName");
+    }
+
+    #[test]
+    fn finds_a_forward_by_its_port_or_its_keyword() {
+        let mut editor = open(NAS);
+        search(&mut editor, "8081");
+        assert_eq!(editor.current_row(), Row::Forward(0));
+
+        let mut editor = open(NAS);
+        search(&mut editor, "localforward");
+        assert_eq!(editor.current_row(), Row::Forward(0));
+        // The unix-socket forward is a raw option row, and matches too.
+        assert_eq!(editor.search_matches("localforward").len(), 2);
+    }
+
+    #[test]
+    fn search_ignores_case() {
+        let mut editor = open(NAS);
+        search(&mut editor, "COMPRESSION");
+        assert_eq!(current_label(&editor), "Compression");
+    }
+
+    #[test]
+    fn esc_puts_the_cursor_back_where_it_started() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |_, row| row == Row::Essential(1));
+        search(&mut editor, "alive");
+        assert_eq!(current_label(&editor), "ServerAliveInterval");
+
+        press(&mut editor, &[KeyCode::Esc]);
+        assert!(editor.search.is_none());
+        assert_eq!(editor.current_row(), Row::Essential(1));
+    }
+
+    #[test]
+    fn enter_stays_on_the_match() {
+        let mut editor = open(NAS);
+        search(&mut editor, "alive");
+        press(&mut editor, &[KeyCode::Enter]);
+        assert!(editor.search.is_none());
+        assert_eq!(current_label(&editor), "ServerAliveInterval");
+    }
+
+    #[test]
+    fn arrows_step_through_matches_while_searching() {
+        let mut editor = open(NAS);
+        search(&mut editor, "localforward");
+        let matches = editor.search_matches("localforward");
+        assert_eq!(editor.cursor, matches[0]);
+        press(&mut editor, &[KeyCode::Down]);
+        assert_eq!(editor.cursor, matches[1]);
+        press(&mut editor, &[KeyCode::Down]);
+        assert_eq!(editor.cursor, matches[0], "wraps round");
+        press(&mut editor, &[KeyCode::Up]);
+        assert_eq!(editor.cursor, matches[1], "and backwards");
+    }
+
+    #[test]
+    fn n_and_shift_n_repeat_the_last_search() {
+        let mut editor = open(NAS);
+        search(&mut editor, "localforward");
+        press(&mut editor, &[KeyCode::Enter]);
+        let matches = editor.search_matches("localforward");
+
+        press(&mut editor, &[KeyCode::Char('n')]);
+        assert_eq!(editor.cursor, matches[1]);
+        press(&mut editor, &[KeyCode::Char('n')]);
+        assert_eq!(editor.cursor, matches[0], "wraps round");
+        press(&mut editor, &[KeyCode::Char('N')]);
+        assert_eq!(editor.cursor, matches[1]);
+    }
+
+    #[test]
+    fn n_with_nothing_to_repeat_says_so() {
+        let mut editor = open(NAS);
+        let before = editor.cursor;
+        press(&mut editor, &[KeyCode::Char('n')]);
+        assert_eq!(editor.cursor, before);
+        assert!(editor.error.as_ref().unwrap().contains("press /"));
+    }
+
+    #[test]
+    fn letters_typed_into_a_search_are_not_commands() {
+        let mut editor = open(NAS);
+        // d would ask to remove a row, a would add a forward, space would toggle.
+        search(&mut editor, "da ");
+        assert!(editor.overlay.is_none());
+        assert_eq!(editor.search.as_ref().unwrap().query.value(), "da ");
+        assert!(editor.forwards.iter().all(|f| f.enabled));
+    }
+
+    #[test]
+    fn no_match_leaves_the_cursor_where_it_was() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |_, row| row == Row::Essential(2));
+        search(&mut editor, "zzz");
+        assert_eq!(editor.current_row(), Row::Essential(2));
+        assert!(editor.search_matches("zzz").is_empty());
+    }
+
+    #[test]
+    fn the_add_rows_are_not_config_lines_and_are_never_matched() {
+        let editor = open(NAS);
+        assert!(editor.search_matches("add a").is_empty());
+    }
+
+    #[test]
+    fn refining_a_search_keeps_the_nearest_match() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |e, row| {
+            e.row_label(row) == "ServerAliveInterval"
+        });
+        let origin = editor.cursor;
+        search(&mut editor, "l");
+        assert_eq!(
+            editor.cursor, origin,
+            "the row it started on already matches"
+        );
+        type_text(&mut editor, "o");
+        // "lo" isn't in ServerAliveInterval, so it moves on to the next one down
+        // rather than back to the top.
+        assert!(editor.cursor > origin);
+        assert!(
+            editor
+                .searchable_text(editor.current_row())
+                .unwrap()
+                .contains("lo")
         );
     }
 

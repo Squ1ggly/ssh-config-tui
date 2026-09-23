@@ -16,7 +16,7 @@ use ratatui::widgets::{Block as Border, BorderType, Clear, List, ListItem, Paddi
 
 use crate::app::{App, Mode, StatusKind};
 use crate::config::{BlockKind, display_path, split_directive};
-use crate::editor::{Editor, ForwardForm, Overlay, Row};
+use crate::editor::{Editor, ForwardForm, Overlay, Row, RowSearch};
 use crate::forward::{Forward, ForwardKind};
 use crate::schema::Kind;
 
@@ -323,6 +323,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    if let Some(editor) = app.editor.as_ref().filter(|_| app.mode == Mode::Edit)
+        && let Some(search) = editor.search.as_ref()
+    {
+        draw_row_search(frame, editor, search, area);
+        return;
+    }
+
     if let Some(status) = &app.status {
         let style = match status.kind {
             StatusKind::Info => Style::new().fg(Color::Green),
@@ -361,6 +368,40 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 type Hint = (&'static str, &'static str);
 
+/// The editor's `/` prompt: the query, where the cursor is among the matches,
+/// and the keys, as far as they fit.
+fn draw_row_search(frame: &mut Frame, editor: &Editor, search: &RowSearch, area: Rect) {
+    let room = area.width as usize;
+    let query = search.query.value();
+    let matches = editor.search_matches(&query);
+    let (count, count_style) = if query.trim().is_empty() {
+        (String::new(), Style::new())
+    } else if matches.is_empty() {
+        ("no match".to_string(), Style::new().fg(Color::Red).bold())
+    } else {
+        let position = matches.iter().position(|&i| i == editor.cursor);
+        let text = match position {
+            Some(position) => format!("{} of {}", position + 1, matches.len()),
+            None => format!("{} matches", matches.len()),
+        };
+        (text, Style::new().fg(Color::Yellow))
+    };
+
+    let hint = "  ↵ jump · ↑↓ next · esc back";
+    let fixed = 3 + 2 + width(&count);
+    let show_hint = room >= fixed + 8 + width(hint);
+    let query_room = room.saturating_sub(fixed + if show_hint { width(hint) } else { 0 });
+    let line = Line::from(vec![
+        Span::styled(" /", Style::new().fg(ACCENT).bold()),
+        Span::raw(truncate_left(&query, query_room)),
+        Span::styled("▌", Style::new().fg(ACCENT)),
+        Span::raw("  "),
+        Span::styled(count, count_style),
+        Span::styled(if show_hint { hint } else { "" }, Style::new().fg(MUTED)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 /// The keys that do something right now in the editor, and the one that
 /// must never be squeezed out: how to get back.
 fn editor_hints(editor: Option<&Editor>) -> (Vec<Hint>, Option<Hint>) {
@@ -391,7 +432,7 @@ fn editor_hints(editor: Option<&Editor>) -> (Vec<Hint>, Option<Hint>) {
                 }
                 _ => {}
             }
-            keys.extend([("a", "add forward"), ("d", "remove")]);
+            keys.extend([("a", "add forward"), ("d", "remove"), ("/", "search")]);
             return (keys, Some(("esc", "done")));
         }
     };
@@ -495,6 +536,12 @@ fn fit_lines(mut lines: Vec<String>, area: Rect) -> Vec<String> {
 fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
     let rows = editor.rows();
     let room = area.width as usize;
+    // While searching, every match is marked, not just the one under the cursor.
+    let matches = editor
+        .search
+        .as_ref()
+        .map(|search| editor.search_matches(&search.query.value()))
+        .unwrap_or_default();
 
     // Labels get the width of the longest one, but never more than two fifths
     // of the row, so the values always have space.
@@ -529,7 +576,15 @@ fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
         }
 
         let focused = index == editor.cursor;
-        let marker = Span::styled(if focused { "▸ " } else { "  " }, Style::new().fg(ACCENT));
+        let matched = !focused && matches.contains(&index);
+        let match_style = Style::new().fg(Color::Yellow).bold();
+        let marker = if focused {
+            Span::styled("▸ ", Style::new().fg(ACCENT))
+        } else if matched {
+            Span::styled("› ", match_style)
+        } else {
+            Span::raw("  ")
+        };
         let emphasis = if focused {
             Style::new().fg(ACCENT).bold()
         } else {
@@ -561,7 +616,9 @@ fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
                     Span::styled(dot, dot_style),
                     Span::styled(
                         format!("{:<7}", forward.kind.label()),
-                        if forward.enabled {
+                        if matched {
+                            match_style
+                        } else if forward.enabled {
                             Style::new().fg(Color::Magenta)
                         } else {
                             Style::new().fg(MUTED)
@@ -600,7 +657,9 @@ fn draw_editor_rows(frame: &mut Frame, editor: &Editor, area: Rect) {
                 } else {
                     (truncate(&value, value_room), Style::new())
                 };
-                let label_style = if is_comment {
+                let label_style = if matched {
+                    match_style
+                } else if is_comment {
                     Style::new().fg(MUTED)
                 } else if focused {
                     emphasis
@@ -1101,6 +1160,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("space", "switch a forward on/off, flip a yes/no"),
         ("a", "add a port forward"),
         ("d", "remove the row (asks first)"),
+        ("/", "search the rows; n / N for next / previous"),
         ("esc", "done, or close a dialog"),
         ("", ""),
         ("", "Every change is saved as you make it."),
@@ -1375,6 +1435,35 @@ Match host bastion
     }
 
     #[test]
+    fn the_editor_search_prompt_shows_where_you_are_among_the_matches() {
+        let mut app = sample_app();
+        press(&mut app, 'j');
+        press(&mut app, 'e');
+        for c in "/local".chars() {
+            press(&mut app, c);
+        }
+        let screen = render(&mut app);
+        let footer = screen.lines().last().unwrap();
+        assert!(footer.contains("/local▌"), "{footer}");
+        assert!(footer.contains("1 of 2"), "{footer}");
+        assert!(
+            screen.contains("› ● local"),
+            "the other match is marked:\n{screen}"
+        );
+
+        for c in "zz".chars() {
+            press(&mut app, c);
+        }
+        assert!(
+            render(&mut app)
+                .lines()
+                .last()
+                .unwrap()
+                .contains("no match")
+        );
+    }
+
+    #[test]
     fn a_host_with_many_rows_scrolls_to_follow_the_cursor() {
         let forwards: String = (0..20)
             .map(|i| format!("    LocalForward {} 127.0.0.1:{}\n", 3000 + i, 3000 + i))
@@ -1423,6 +1512,20 @@ Match host bastion
             focus(&mut app, "+ add a port forward");
             app.on_key(key(KeyCode::Enter));
             println!("\n=== FORWARD {w}x{h} ===\n{}", render_at(&mut app, w, h));
+        }
+
+        // Searching the editor's rows.
+        for (w, h) in [(96, 26), (44, 14)] {
+            let mut app = sample_app();
+            press(&mut app, 'j');
+            press(&mut app, 'e');
+            for c in "/local".chars() {
+                press(&mut app, c);
+            }
+            println!(
+                "\n=== ROW SEARCH {w}x{h} ===\n{}",
+                render_at(&mut app, w, h)
+            );
         }
 
         // Switched-off forward, and the dialogs, at a mid and a small size.

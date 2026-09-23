@@ -116,6 +116,12 @@ In the editor: `↑`/`↓` move, `enter` edits the row or opens its dialog, `a`
 adds a port forward, `space` switches a forward on/off or flips a yes/no, `d`
 removes the row (asks first), `esc` closes a dialog or leaves the editor.
 
+`/` searches the host's rows by name or value — `/alive` jumps to
+`ServerAliveInterval`, `/8081` to the forward on that port. The cursor
+follows the first match as you type and every match is marked; `↑`/`↓` step
+through them, `enter` stays put, `esc` goes back to where you were. After a
+search, `n` and `N` jump to the next and previous match.
+
 The footer always shows the keys that do something right now.
 
 ## Small terminals

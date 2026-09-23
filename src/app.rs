@@ -931,6 +931,21 @@ Host web
         );
     }
 
+    #[test]
+    fn slash_in_the_editor_searches_its_rows_not_the_host_list() {
+        let mut app = app_with("editor-search", SAMPLE);
+        press(&mut app, "je");
+        press(&mut app, "/");
+        assert_eq!(app.mode, Mode::Edit, "stays in the editor");
+        press(&mut app, "user");
+        app.on_key(key(KeyCode::Enter));
+
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.row_label(editor.current_row()), "User");
+        assert!(app.filter.is_empty(), "the host filter is untouched");
+        assert_eq!(read_back(&app), SAMPLE, "searching changes nothing");
+    }
+
     // --- dangerous actions ask first -------------------------------------
 
     #[test]
