@@ -2,7 +2,7 @@
 # "sshconfig" was already taken on crates.io; the command it installs is
 # still `sshconfig` (see [[bin]] below).
 name = "ssh-config-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # The oldest toolchain that builds it: ratatui 0.30 needs 1.88, and so do the
 # `if let ... && let ...` chains used here.
