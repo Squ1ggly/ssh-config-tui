@@ -2,8 +2,8 @@
 
 A terminal UI for managing `~/.ssh/config`, built with [ratatui](https://ratatui.rs/).
 
-Run `sshconfig` and you get your hosts in a list: arrow around, hit `enter` to
-ssh into one, `e` to edit it, `a` to add one.
+Run `sshconfig` and you get your hosts in a list: arrow around, hit `l` to
+log in to one, `enter` to edit it, `a` to add one.
 
 ```
  sshconfig  /Users/you/.ssh/config  3 hosts
@@ -15,9 +15,9 @@ ssh into one, `e` to edit it, `a` to add one.
 │                                  ││   User           st                   │
 │                                  ││   local          8081 → 127.0.0.1:8081│
 │                                  ││                                       │
-│                                  ││   ↵ ssh nas                           │
+│                                  ││   l ssh nas                           │
 ╰──────────────────────────────────╯╰───────────────────────────────────────╯
- ↵ connect  a add  e edit  d delete  y dup  / search  r reload  ? help  q quit
+ l login  ↵ edit  a add  d delete  y dup  / search  r reload  ? help  q quit
 ```
 
 ## Install
@@ -29,8 +29,8 @@ cargo install --path .
 ## You don't have to know the directive names
 
 The host editor is a list of rows. Move with `↑`/`↓`, press `enter` to change
-whatever you are on, `space` to flip a yes/no, `d` to remove it, `ctrl-s` to
-save. Every row explains itself in a line of prose at the bottom of the form.
+whatever you are on, `space` to flip a yes/no, `d` to remove it, `a` to add a
+port forward from anywhere, `ctrl-s` to save. Every row explains itself in a line of prose at the bottom of the form.
 
 ```
 ╭ Edit host ───────────────────────────────────────────╮
@@ -82,19 +82,19 @@ python3 tools/gen_schema.py     # regenerates src/schema.rs
 | --- | --- |
 | `j` `k` `↑` `↓` | move between hosts |
 | `g` `G` | jump to first / last |
-| `enter` | ssh to the selected host |
+| `l` | log in: ssh to the selected host |
 | `/` | filter by alias, hostname or user |
 | `a` | add a host |
-| `e` | edit the selected host |
+| `enter` / `e` | edit the selected host |
 | `y` | duplicate the selected host |
 | `d` | delete (asks first) |
 | `r` | reload the file from disk |
 | `?` | help |
 | `q` | quit |
 
-In the editor: `↑`/`↓` move, `enter` edits the row or opens its dialog, `space`
-flips a yes/no, `d` removes the row, `ctrl-s` saves, `esc` cancels or closes a
-dialog.
+In the editor: `↑`/`↓` move, `enter` edits the row or opens its dialog, `a`
+adds a port forward, `space` flips a yes/no, `d` removes the row, `ctrl-s`
+saves, `esc` cancels or closes a dialog.
 
 ## How it treats your file
 

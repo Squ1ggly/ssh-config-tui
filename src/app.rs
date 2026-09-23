@@ -174,7 +174,7 @@ impl App {
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('a') => self.begin_add(),
-            KeyCode::Char('e') => self.begin_edit(),
+            KeyCode::Char('e') | KeyCode::Enter => self.begin_edit(),
             KeyCode::Char('y') => self.duplicate(),
             KeyCode::Char('d') => {
                 if self.selected_block().is_some() {
@@ -182,7 +182,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.reload(),
-            KeyCode::Enter => self.begin_connect(),
+            KeyCode::Char('l') => self.begin_connect(),
             _ => {}
         }
     }
@@ -669,13 +669,22 @@ Host web
     #[test]
     fn connecting_is_refused_for_wildcard_entries() {
         let mut app = app_with("connect", SAMPLE);
-        app.on_key(key(KeyCode::Enter));
+        press(&mut app, "l");
         assert!(app.connect_to.is_none());
         assert!(matches!(app.status, Some((_, StatusKind::Error))));
 
+        press(&mut app, "jl");
+        assert_eq!(app.connect_to.as_deref(), Some("nas"));
+    }
+
+    #[test]
+    fn enter_opens_the_editor_just_like_e() {
+        let mut app = app_with("enter", SAMPLE);
         press(&mut app, "j");
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.connect_to.as_deref(), Some("nas"));
+        assert_eq!(app.mode, Mode::Edit);
+        assert_eq!(app.editor.as_ref().unwrap().alias, "nas");
+        assert!(app.connect_to.is_none(), "enter no longer connects");
     }
 
     #[test]
@@ -697,6 +706,8 @@ Host web
             "delete with nothing selected is a no-op"
         );
         app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::List, "nothing to edit");
+        press(&mut app, "l");
         assert!(app.connect_to.is_none());
         press(&mut app, "j");
         assert!(app.selected().is_none());

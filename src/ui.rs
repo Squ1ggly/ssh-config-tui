@@ -163,7 +163,7 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     if block.kind == BlockKind::Host && !block.is_pattern() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("  ↵ ", Style::new().fg(Color::Green)),
+            Span::styled("  l ", Style::new().fg(Color::Green)),
             Span::styled(format!("ssh {}", block.label()), Style::new().fg(MUTED)),
         ]));
     }
@@ -199,9 +199,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let keys = [
-        ("↵", "connect"),
+        ("l", "login"),
+        ("↵", "edit"),
         ("a", "add"),
-        ("e", "edit"),
         ("d", "delete"),
         ("y", "dup"),
         ("/", "search"),
@@ -275,8 +275,8 @@ fn draw_editor(frame: &mut Frame, app: &App, area: Rect) {
         &[("↵", "accept"), ("esc", "discard"), ("^s", "save host")]
     } else {
         &[
-            ("↑↓", "move"),
             ("↵", "edit"),
+            ("a", "add forward"),
             ("space", "toggle"),
             ("d", "remove"),
             ("^s", "save"),
@@ -745,10 +745,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let rows = [
         ("j / k / ↑ / ↓", "move between hosts"),
         ("g / G", "jump to first / last"),
-        ("enter", "ssh to the selected host"),
+        ("l", "log in (ssh to the selected host)"),
         ("/", "filter by alias, hostname or user"),
         ("a", "add a new host"),
-        ("e", "edit the selected host"),
+        ("enter / e", "edit the selected host"),
         ("y", "duplicate the selected host"),
         ("d", "delete (asks first)"),
         ("r", "reload the file from disk"),
@@ -757,6 +757,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("in the host editor:", ""),
         ("↑ / ↓", "move between rows"),
         ("enter", "edit the row, or open its dialog"),
+        ("a", "add a port forward"),
         ("space", "flip a yes/no option"),
         ("d", "remove the row"),
         ("ctrl-s", "save to ~/.ssh/config"),

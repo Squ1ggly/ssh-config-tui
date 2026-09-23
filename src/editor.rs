@@ -192,9 +192,18 @@ impl Editor {
             KeyCode::Enter => self.activate(),
             KeyCode::Char(' ') => self.toggle_or_activate(),
             KeyCode::Char('d') | KeyCode::Delete => self.delete_row(),
+            KeyCode::Char('a') => self.add_forward(),
             _ => {}
         }
         None
+    }
+
+    /// Opens the forward form for a new tunnel, from wherever the cursor is.
+    fn add_forward(&mut self) {
+        self.overlay = Some(Overlay::Forward(ForwardForm::new(
+            None,
+            Forward::new(ForwardKind::Local),
+        )));
     }
 
     /// Enter on the focused row: edit it, or open the right dialog.
@@ -204,12 +213,7 @@ impl Editor {
             Row::AddOption => {
                 self.overlay = Some(Overlay::Picker(Picker::new()));
             }
-            Row::AddForward => {
-                self.overlay = Some(Overlay::Forward(ForwardForm::new(
-                    None,
-                    Forward::new(ForwardKind::Local),
-                )));
-            }
+            Row::AddForward => self.add_forward(),
             Row::Forward(i) => {
                 self.overlay = Some(Overlay::Forward(ForwardForm::new(
                     Some(i),
@@ -984,6 +988,52 @@ Host nas
     }
 
     #[test]
+    fn a_opens_a_new_forward_from_any_row() {
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |e, row| {
+            e.row_label(row) == "ServerAliveInterval"
+        });
+        press(&mut editor, &[KeyCode::Char('a')]);
+
+        let Some(Overlay::Forward(form)) = editor.overlay.as_ref() else {
+            panic!("expected the forward form");
+        };
+        assert!(form.index.is_none(), "a new forward, not an edit of one");
+        assert_eq!(form.forward.kind, ForwardKind::Local);
+    }
+
+    #[test]
+    fn a_still_types_an_a_inside_text_fields() {
+        // Typing a value.
+        let mut editor = open(NAS);
+        focus_row(&mut editor, |_, row| row == Row::Essential(1));
+        press(&mut editor, &[KeyCode::Enter]);
+        type_text(&mut editor, "a");
+        press(&mut editor, &[KeyCode::Enter]);
+        assert_eq!(editor.essentials[1], "sta");
+        assert!(editor.overlay.is_none());
+
+        // Searching the option picker.
+        focus_row(&mut editor, |_, row| row == Row::AddOption);
+        press(&mut editor, &[KeyCode::Enter]);
+        type_text(&mut editor, "agent");
+        let Some(Overlay::Picker(picker)) = editor.overlay.as_ref() else {
+            panic!("picker should still be open");
+        };
+        assert_eq!(picker.query.value(), "agent");
+
+        // Filling in a forward.
+        press(&mut editor, &[KeyCode::Esc]);
+        press(&mut editor, &[KeyCode::Char('a')]);
+        press(&mut editor, &[KeyCode::Down]); // bind address
+        type_text(&mut editor, "a");
+        let Some(Overlay::Forward(form)) = editor.overlay.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.inputs[0].value(), "a");
+    }
+
+    #[test]
     fn a_dynamic_forward_only_asks_for_a_port() {
         let mut editor = open("Host a\n");
         focus_row(&mut editor, |_, row| row == Row::AddForward);
@@ -1105,7 +1155,7 @@ Host nas
 #[cfg(test)]
 mod real_hosts {
     use super::*;
-    use crate::config::{default_path, BlockKind, SshConfig};
+    use crate::config::{BlockKind, SshConfig, default_path};
 
     /// Loading every host into the editor and saving it straight back must not
     /// add, drop or alter a single directive — only regroup them.
@@ -1113,7 +1163,9 @@ mod real_hosts {
     #[ignore = "reads the developer's own ~/.ssh/config"]
     fn survive_a_round_trip_through_the_editor() {
         let path = default_path();
-        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
         let config = SshConfig::parse(path, &text);
 
         for block in config.blocks.iter().filter(|b| b.kind == BlockKind::Host) {
