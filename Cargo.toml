@@ -1,7 +1,25 @@
 [package]
-name = "sshconfig"
+# "sshconfig" was already taken on crates.io; the command it installs is
+# still `sshconfig` (see [[bin]] below).
+name = "ssh-config-tui"
 version = "0.1.0"
 edition = "2024"
+# The oldest toolchain that builds it: ratatui 0.30 needs 1.88, and so do the
+# `if let ... && let ...` chains used here.
+rust-version = "1.88"
+description = "A terminal UI for ~/.ssh/config: connect to hosts, manage port forwards, and edit any ssh_config option without memorising directive names"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Squ1ggly/ssh-config-tui"
+readme = "README.md"
+keywords = ["ssh", "ssh-config", "tui", "ratatui", "terminal"]
+categories = ["command-line-utilities", "config"]
+# Only what's needed to build it, plus the generator for src/schema.rs so the
+# generated file can be checked against its source.
+include = ["/src", "/tools", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
+
+[[bin]]
+name = "sshconfig"
+path = "src/main.rs"
 
 [dependencies]
 dirs = "7"

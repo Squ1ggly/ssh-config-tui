@@ -23,8 +23,13 @@ log in to one, `enter` to edit it, `a` to add one.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install ssh-config-tui --locked
 ```
+
+That installs a command called `sshconfig`. It needs Rust 1.88 or newer
+(`rustup update` if yours is older).
+
+To build from a checkout instead: `cargo install --path . --locked`.
 
 ## You don't have to know the directive names
 
@@ -178,3 +183,13 @@ cargo test screens -- --ignored --nocapture    # dump every screen as text
 cargo test -- --ignored real_config            # round-trip your own config
 cargo test -- --ignored real_hosts             # edit every host, check nothing changes
 ```
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
