@@ -27,7 +27,9 @@ const USAGE: &str = "\
 sshconfig — a terminal UI for ~/.ssh/config
 
 Usage:
-  sshconfig [options]
+  sshconfig [options] [host]
+
+  Naming a host opens its editor straight away.
 
 Options:
   -f, --file <path>   Config file to edit (default: ~/.ssh/config)
@@ -36,8 +38,8 @@ Options:
 ";
 
 fn main() -> io::Result<()> {
-    let path = match parse_args() {
-        Ok(Some(path)) => path,
+    let Args { path, host } = match parse_args() {
+        Ok(Some(args)) => args,
         Ok(None) => return Ok(()),
         Err(message) => {
             eprintln!("{message}");
@@ -48,6 +50,9 @@ fn main() -> io::Result<()> {
     let config = SshConfig::load(path)
         .map_err(|e| io::Error::new(e.kind(), format!("could not read config: {e}")))?;
     let mut app = App::new(config);
+    if let Some(host) = host {
+        app.open_host(&host);
+    }
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
@@ -55,9 +60,16 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn parse_args() -> Result<Option<PathBuf>, String> {
+struct Args {
+    path: PathBuf,
+    /// A host to open in the editor on start.
+    host: Option<String>,
+}
+
+fn parse_args() -> Result<Option<Args>, String> {
     let mut args = std::env::args().skip(1);
     let mut path = None;
+    let mut host = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -72,10 +84,16 @@ fn parse_args() -> Result<Option<PathBuf>, String> {
                 let value = args.next().ok_or("error: --file needs a path")?;
                 path = Some(PathBuf::from(value));
             }
-            other => return Err(format!("error: unknown argument '{other}'\n\n{USAGE}")),
+            other if other.starts_with('-') || host.is_some() => {
+                return Err(format!("error: unknown argument '{other}'\n\n{USAGE}"));
+            }
+            other => host = Some(other.to_string()),
         }
     }
-    Ok(Some(path.unwrap_or_else(config::default_path)))
+    Ok(Some(Args {
+        path: path.unwrap_or_else(config::default_path),
+        host,
+    }))
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {

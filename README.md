@@ -177,9 +177,13 @@ don't fit the host form, so edit those in your editor.
 
 ```
 sshconfig [-f|--file <path>]   # default: ~/.ssh/config
+sshconfig <host>               # open that host's editor straight away
 sshconfig --help
 sshconfig --version
 ```
+
+Ctrl+C quits from any screen. If a change couldn't be saved it asks first;
+press Ctrl+C again to quit anyway.
 
 ## Development
 

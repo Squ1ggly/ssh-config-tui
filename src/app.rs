@@ -262,6 +262,23 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Ctrl+C quits from anywhere. A second press answers the unsaved
+        // changes question with "quit anyway".
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let asking_to_quit = self.mode == Mode::Confirm
+                && self.confirm.as_ref().is_some_and(|c| {
+                    c.choices
+                        .iter()
+                        .any(|(_, _, action)| *action == Action::Quit)
+                });
+            if asking_to_quit {
+                self.confirm = None;
+                self.should_quit = true;
+            } else {
+                self.quit();
+            }
+            return;
+        }
         match self.mode {
             Mode::List => self.on_key_list(key),
             Mode::Search => self.on_key_search(key),
@@ -275,10 +292,8 @@ impl App {
 
     fn on_key_list(&mut self, key: KeyEvent) {
         self.status = None;
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit(),
-            KeyCode::Char('c') if ctrl => self.quit(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('g') | KeyCode::Home => self.list_state.select_first(),
@@ -421,6 +436,36 @@ impl App {
     fn begin_add(&mut self) {
         self.editor = Some(Editor::new_host());
         self.mode = Mode::Edit;
+    }
+
+    /// Opens the editor on the host with this alias, as `sshconfig <host>`
+    /// does. If there's no such host, the list is shown filtered by the name
+    /// instead, so a near miss is one keypress away.
+    pub fn open_host(&mut self, name: &str) {
+        let find = |exact: bool| {
+            self.config.blocks.iter().position(|block| {
+                block.kind == BlockKind::Host
+                    && block.patterns().iter().any(|p| {
+                        if exact {
+                            p == name
+                        } else {
+                            p.eq_ignore_ascii_case(name)
+                        }
+                    })
+            })
+        };
+        match find(true).or_else(|| find(false)) {
+            Some(index) => {
+                self.list_state.select(Some(index));
+                self.begin_edit();
+            }
+            None => {
+                self.filter = name.to_string();
+                self.list_state.select(Some(0));
+                self.clamp_selection();
+                self.error(format!("No host called {name}"));
+            }
+        }
     }
 
     fn begin_edit(&mut self) {
@@ -1152,6 +1197,74 @@ Host web
         assert!(app.connect_to.is_none());
         press(&mut app, "j");
         assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn a_host_named_on_the_command_line_opens_straight_in_the_editor() {
+        let mut app = app_with("open", SAMPLE);
+        app.open_host("nas");
+        assert_eq!(app.mode, Mode::Edit);
+        assert_eq!(app.editor.as_ref().unwrap().alias, "nas");
+
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::List, "esc goes back to the list");
+        assert_eq!(app.selected().unwrap().label(), "nas");
+    }
+
+    #[test]
+    fn a_host_is_found_by_any_of_its_aliases_ignoring_case() {
+        let mut app = app_with(
+            "open-alias",
+            "Host a b-side
+    User x
+",
+        );
+        app.open_host("B-SIDE");
+        assert_eq!(app.mode, Mode::Edit);
+    }
+
+    #[test]
+    fn an_unknown_host_on_the_command_line_filters_the_list() {
+        let mut app = app_with("open-missing", SAMPLE);
+        app.open_host("we");
+        assert_eq!(app.mode, Mode::List);
+        assert!(is_error(&app));
+        assert_eq!(app.filter, "we");
+        assert_eq!(app.selected().unwrap().label(), "web");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_anywhere() {
+        let mut app = app_with("ctrl-c-edit", SAMPLE);
+        press(&mut app, "je");
+        focus(&mut app, "HostName");
+        app.on_key(key(KeyCode::Enter)); // typing in a box
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit);
+
+        let mut app = app_with("ctrl-c-search", SAMPLE);
+        press(&mut app, "/");
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_twice_quits_despite_unsaved_changes() {
+        let mut app = app_with("ctrl-c-unsaved", SAMPLE);
+        std::fs::write(
+            &app.config.path,
+            "Host theirs
+",
+        )
+        .unwrap();
+        press(&mut app, "je");
+        set_row(&mut app, "HostName", "10.0.0.9");
+        assert_eq!(app.mode, Mode::Confirm, "the conflict question");
+
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit, "asks before losing the change");
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit);
     }
 
     #[test]
