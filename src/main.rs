@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod editor;
 mod forward;
+mod keys;
 mod schema;
 mod textinput;
 mod ui;

@@ -11,6 +11,7 @@ use ratatui::widgets::ListState;
 
 use crate::config::{Block, BlockKind, SaveError, SshConfig, display_path};
 use crate::editor::{Editor, EditorEvent};
+use crate::keys;
 
 /// How long a message stays in the status bar.
 pub const INFO_TTL: Duration = Duration::from_secs(2);
@@ -198,6 +199,18 @@ impl App {
         self.list_state.select(Some(next));
     }
 
+    /// Moves the selection a page, stopping at either end rather than
+    /// wrapping round.
+    fn page_selection(&mut self, delta: isize) {
+        let len = self.visible().len() as isize;
+        if len == 0 {
+            return;
+        }
+        let current = self.list_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, len - 1) as usize;
+        self.list_state.select(Some(next));
+    }
+
     /// Opens a confirm dialog over whatever is on screen.
     fn ask(
         &mut self,
@@ -292,7 +305,11 @@ impl App {
 
     fn on_key_list(&mut self, key: KeyEvent) {
         self.status = None;
-        match key.code {
+        if let Some(rows) = keys::page(&key) {
+            self.page_selection(rows);
+            return;
+        }
+        match keys::command(&key) {
             KeyCode::Char('q') | KeyCode::Esc => self.quit(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
@@ -303,8 +320,6 @@ impl App {
                     self.list_state.select(Some(len - 1));
                 }
             }
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::PageUp => self.move_selection(-10),
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
             }
@@ -333,7 +348,7 @@ impl App {
                 self.filter.pop();
                 self.clamp_selection();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.filter.push(c);
                 self.list_state.select(Some(0));
                 self.clamp_selection();
@@ -351,7 +366,7 @@ impl App {
         };
         self.mode = confirm.back_to;
 
-        let chosen = match key.code {
+        let chosen = match keys::command(&key) {
             KeyCode::Char(c) => confirm
                 .choices
                 .iter()
@@ -1010,6 +1025,28 @@ Host web
         assert!(!text.contains("# the NAS"), "the host's label goes with it");
         assert!(text.contains("Host web"));
         assert!(text.contains("Host *"));
+    }
+
+    #[test]
+    fn d_with_a_modifier_is_not_delete() {
+        let mut app = app_with("modified-d", SAMPLE);
+        app.on_key(KeyEvent {
+            modifiers: KeyModifiers::SHIFT,
+            ..key(KeyCode::Char('d'))
+        });
+        app.on_key(KeyEvent {
+            modifiers: KeyModifiers::ALT,
+            ..key(KeyCode::Char('d'))
+        });
+        assert_eq!(app.mode, Mode::List, "only a plain d deletes");
+
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::List, "ctrl+d pages rather than deleting");
+        let last = app.visible().len() - 1;
+        assert_eq!(app.list_state.selected(), Some(last), "stops at the end");
+        app.on_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(read_back(&app), SAMPLE);
     }
 
     #[test]

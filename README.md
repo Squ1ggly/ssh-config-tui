@@ -102,6 +102,7 @@ python3 tools/gen_schema.py     # regenerates src/schema.rs
 | --- | --- |
 | `j` `k` `↑` `↓` | move between hosts |
 | `g` `G` | jump to first / last |
+| `ctrl+d` `ctrl+u` | page down / up (also `pgdn` `pgup`) |
 | `l` | log in: ssh to the selected host |
 | `/` | filter by alias, hostname or user |
 | `a` | add a host |
@@ -112,9 +113,13 @@ python3 tools/gen_schema.py     # regenerates src/schema.rs
 | `?` | help |
 | `q` | quit |
 
-In the editor: `↑`/`↓` move, `enter` edits the row or opens its dialog, `a`
-adds a port forward, `space` switches a forward on/off or flips a yes/no, `d`
-removes the row (asks first), `esc` closes a dialog or leaves the editor.
+In the editor: `↑`/`↓` move, `ctrl+d`/`ctrl+u` page down / up, `enter` edits
+the row or opens its dialog, `a` adds a port forward, `space` switches a
+forward on/off or flips a yes/no, `d` removes the row (asks first), `esc`
+closes a dialog or leaves the editor.
+
+Letter commands only fire on the letter by itself: `ctrl+d`, `alt+d` and
+`shift+d` are not `d`.
 
 `/` searches the host's rows by name or value — `/alive` jumps to
 `ServerAliveInterval`, `/8081` to the forward on that port. The cursor

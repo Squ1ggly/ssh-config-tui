@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use crate::config::{Block, split_directive};
 use crate::forward::{Forward, ForwardKind, is_port};
+use crate::keys;
 use crate::schema::{self, Keyword, Kind};
 use crate::textinput::TextInput;
 use crate::validate;
@@ -236,6 +237,12 @@ impl Editor {
         self.cursor = (self.cursor as isize + delta).rem_euclid(len) as usize;
     }
 
+    /// Moves the cursor a page, stopping at either end rather than wrapping.
+    fn page_cursor(&mut self, delta: isize) {
+        let last = self.rows().len() as isize - 1;
+        self.cursor = (self.cursor as isize + delta).clamp(0, last.max(0)) as usize;
+    }
+
     fn focus(&mut self, row: Row) {
         if let Some(index) = self.rows().iter().position(|r| *r == row) {
             self.cursor = index;
@@ -255,7 +262,11 @@ impl Editor {
             return EditorEvent::None;
         }
 
-        match key.code {
+        if let Some(rows) = keys::page(&key) {
+            self.page_cursor(rows);
+            return EditorEvent::None;
+        }
+        match keys::command(&key) {
             KeyCode::Esc => return EditorEvent::Close,
             KeyCode::Char('/') => {
                 self.search = Some(RowSearch {
@@ -579,7 +590,7 @@ impl Editor {
                 }
                 PickerResult::Continue => {}
             },
-            Some(Overlay::Choice(choice)) => match key.code {
+            Some(Overlay::Choice(choice)) => match keys::command(&key) {
                 KeyCode::Esc => self.overlay = None,
                 KeyCode::Down | KeyCode::Char('j') => choice.move_by(1),
                 KeyCode::Up | KeyCode::Char('k') => choice.move_by(-1),
@@ -620,7 +631,7 @@ impl Editor {
             Some(Overlay::ConfirmRemove(row)) => {
                 let row = *row;
                 self.overlay = None;
-                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                if matches!(keys::command(&key), KeyCode::Char('y') | KeyCode::Char('Y')) {
                     self.remove_row(row);
                     return EditorEvent::Changed;
                 }

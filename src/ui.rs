@@ -1145,6 +1145,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let rows = [
         ("j / k / ↑ / ↓", "move between hosts"),
         ("g / G", "jump to first / last"),
+        ("ctrl+d / ctrl+u", "page down / up (also pgdn / pgup)"),
         ("l", "log in (ssh to the selected host)"),
         ("/", "filter by alias, hostname or user"),
         ("a", "add a new host"),
@@ -1156,6 +1157,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("", ""),
         ("in the editor", ""),
         ("↑ / ↓", "move between rows"),
+        ("ctrl+d / ctrl+u", "page down / up"),
         ("enter", "edit the row, or open its dialog"),
         ("space", "switch a forward on/off, flip a yes/no"),
         ("a", "add a port forward"),
